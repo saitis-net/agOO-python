@@ -261,6 +261,28 @@ SOLUTION — three-layer fix:
      download failure.  Removed the surrogateescape encoding workaround
      (no longer needed since the body is written as raw bytes).
 
+------------------------------------------------------------------------
+[FEAT-03] 10% cache safety margin + unconditional post-batch sync
+Severity : N/A (behaviour change)
+Location : client.py — module constant _CACHE_SAFETY_MARGIN,
+                        Agoo.temp_put(), Agoo.batch_put()
+------------------------------------------------------------------------
+CHANGE 1 — Cache safety margin (_CACHE_SAFETY_MARGIN = 0.10):
+  Added module-level constant reserving 10% of total cache capacity.
+  Effective usable space = total * 0.90 - used.
+  Applied in both temp_put() (per-file space check) and batch_put()
+  (batch-planning available-space calculation) so the margin is
+  consistently honoured at every upload entry point.
+
+CHANGE 2 — Unconditional post-batch sync in batch_put():
+  async_synchronize() is now triggered after EVERY batch, not only when
+  deferred files remain.  This ensures:
+    - The cache is emptied (files archived) after each batch, not just
+      when the next batch needs the space.
+    - The final batch is also archived before batch_put() returns, so
+      the caller knows data is in archive, not merely in temp.
+  The sync-completion poll loop is unchanged.
+
 UNCHANGED / OUT OF SCOPE
 - logout(): not yet implemented in the original Perl module; left as
   NotImplementedError.

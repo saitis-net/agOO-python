@@ -60,6 +60,12 @@ _DEFAULT_TIMEOUT = (10, 60)
 # third-party domain controlled by the server operator.
 _MAX_REDIRECTS = 5
 
+# Fraction of total cache capacity reserved as a safety margin.
+# Effective usable space = total * (1 - _CACHE_SAFETY_MARGIN) - used.
+# Keeping 10% headroom avoids filling the cache completely, which could
+# interfere with server-side housekeeping that also needs cache space.
+_CACHE_SAFETY_MARGIN = 0.10
+
 
 class Agoo:
     """Client for the agOO remote storage service.
@@ -649,18 +655,25 @@ class Agoo:
             )
             return None
 
-        available = total - used
+        # Apply the safety margin: only count space up to (1 - margin) of total.
+        # This reserves _CACHE_SAFETY_MARGIN of total capacity for server-side
+        # housekeeping and prevents the cache from being filled to the brim.
+        usable    = int(total * (1.0 - _CACHE_SAFETY_MARGIN))
+        available = max(0, usable - used)
+
         if file_size > available:
             self._error = (
                 f"insufficient cache space for '{f}': "
                 f"file is {file_size:,} bytes but only {available:,} bytes available "
-                f"({used:,} of {total:,} bytes used)"
+                f"({used:,} used of {total:,} total, "
+                f"{_CACHE_SAFETY_MARGIN * 100:.0f}% safety margin reserved)"
             )
             return None
 
         self._debug(
             f"space check OK: file={file_size:,} B  "
-            f"available={available:,} B  used={used:,}/{total:,} B"
+            f"available={available:,} B  used={used:,}/{total:,} B  "
+            f"margin={_CACHE_SAFETY_MARGIN * 100:.0f}%"
         )
 
         # --- Step 1: Announce the upload ---
@@ -720,15 +733,16 @@ class Agoo:
         -------------------------------------------------
         At the start of each batch:
           1. get_usage() is called to measure currently available cache space.
+             Usable space = total * (1 - _CACHE_SAFETY_MARGIN) - used, so a
+             10% safety margin is always kept free for server housekeeping.
           2. Files are considered in order.  A file is added to the current
              batch as long as the running total of that batch would not exceed
-             available space.  Files that would overflow the batch are deferred
-             to the next batch.
+             the usable space.  Files that would overflow are deferred.
           3. Every file in the batch is uploaded with temp_put().
-          4. If deferred files remain, async_synchronize() is called to trigger
-             an archive migration of the uploaded batch, then async_completed()
-             is polled every poll_interval seconds until the job finishes.
-             The freed cache space allows the next batch to proceed.
+          4. async_synchronize() is always called after every batch — even the
+             last one — so files are migrated from cache to archive and the
+             cache is emptied.  async_completed() is polled every poll_interval
+             seconds until the job finishes before proceeding.
           5. Steps 1-4 repeat until all files have been uploaded.
 
         A file whose size alone exceeds the total cache capacity can never be
@@ -829,13 +843,19 @@ class Agoo:
                 )
                 return None
 
-            used      = usage.get("used", 0)
-            total     = usage.get("total", 0)
-            available = total - used   # bytes free in the cache right now
+            used  = usage.get("used", 0)
+            total = usage.get("total", 0)
+
+            # Honour the safety margin: cap usable space at (1 - margin) of
+            # total so the cache is never filled to the brim.
+            usable    = int(total * (1.0 - _CACHE_SAFETY_MARGIN))
+            available = max(0, usable - used)
 
             self._debug(
-                f"batch_put: cache available={available:,} B  "
+                f"batch_put: cache usable={usable:,} B  "
+                f"available={available:,} B  "
                 f"used={used:,}/{total:,} B  "
+                f"margin={_CACHE_SAFETY_MARGIN * 100:.0f}%  "
                 f"{len(pending)} file(s) remaining"
             )
 
@@ -906,56 +926,63 @@ class Agoo:
             )
 
             # ---------------------------------------------------------------
-            # If there are more files to upload, trigger an archive sync now
-            # so the server can migrate the current batch from temp (cache)
-            # to archive storage, reclaiming cache space for the next batch.
+            # Sync after every batch — not just when files remain.
             #
-            # We poll async_completed() until the job finishes before
-            # proceeding to avoid starting the next batch while the cache is
-            # still full.
+            # Triggering async_synchronize() unconditionally ensures that
+            # every batch is migrated from temp (cache) to archive storage
+            # before we return, keeping the cache consistently empty.
+            # On the last batch this archives the final files; on earlier
+            # batches it reclaims space so the next batch can proceed.
+            #
+            # We block on async_completed() so the caller knows the data is
+            # safely in archive, not just sitting in temp, when we return.
             # ---------------------------------------------------------------
             if next_pending:
-                self._debug(
-                    f"batch_put: {len(next_pending)} file(s) deferred — "
-                    f"triggering archive sync to reclaim cache space…"
+                sync_reason = (
+                    f"{len(next_pending)} file(s) still pending — "
+                    f"reclaiming cache space"
                 )
+            else:
+                sync_reason = "final batch — archiving uploaded files"
 
-                job_id = self.async_synchronize()
-                if job_id is None:
+            self._debug(f"batch_put: triggering archive sync ({sync_reason})…")
+
+            job_id = self.async_synchronize()
+            if job_id is None:
+                self._error = (
+                    "batch_put: failed to trigger archive sync: "
+                    + (self._error or "async_synchronize() returned no job ID")
+                )
+                return None
+
+            self._debug(f"batch_put: sync job queued — ID={job_id}")
+
+            # Poll until the server reports the job is done.
+            while True:
+                status = self.async_completed(job_id)
+
+                if status is None:
+                    # None means the "finished.<id>" file does not exist
+                    # yet — the job is still running.
+                    self._debug(
+                        f"batch_put: sync {job_id} still running — "
+                        f"waiting {poll_interval}s…"
+                    )
+                    time.sleep(poll_interval)
+                    continue
+
+                # Any integer means the job completed.
+                if status != 0:
                     self._error = (
-                        "batch_put: failed to trigger archive sync: "
-                        + (self._error or "async_synchronize() returned no job ID")
+                        f"batch_put: sync job {job_id} finished with "
+                        f"non-zero status {status}"
                     )
                     return None
 
-                self._debug(f"batch_put: sync job queued — ID={job_id}")
+                self._debug(f"batch_put: sync {job_id} completed (status 0)")
+                break  # cache space reclaimed; proceed to next batch or finish
 
-                # Poll until the server reports the job is done.
-                while True:
-                    status = self.async_completed(job_id)
-
-                    if status is None:
-                        # None means the "finished.<id>" file does not exist
-                        # yet — the job is still running.
-                        self._debug(
-                            f"batch_put: sync {job_id} still running — "
-                            f"waiting {poll_interval}s…"
-                        )
-                        time.sleep(poll_interval)
-                        continue
-
-                    # Any integer means the job completed.
-                    if status != 0:
-                        self._error = (
-                            f"batch_put: sync job {job_id} finished with "
-                            f"non-zero status {status}"
-                        )
-                        return None
-
-                    self._debug(f"batch_put: sync {job_id} completed (status 0)")
-                    break  # cache space should now be reclaimed; start next batch
-
-            # Advance to the deferred files (may be empty, ending the loop).
+            # Advance to the deferred files (empty on the last batch).
             pending = next_pending
 
         self._debug(
