@@ -188,7 +188,11 @@ See `changes.log` for full details of the audit findings and mitigations.
 - **Path traversal prevention** — `temp_put()` validates that the local file
   path stays within the current working directory.
 - **Credential minimisation** — The plaintext password is erased from memory
-  immediately after a successful login.
+  immediately after a successful login.  If the session token expires and
+  re-authentication is needed, `login()` prompts interactively via
+  `getpass.getpass()` rather than keeping the password in memory between calls.
+  In non-interactive contexts (daemons, CI) where no terminal is available,
+  a clear error is returned instead of crashing.
 - **Redirect cap** — HTTP redirects are limited to 5 per request to prevent
   loops and token leakage to third-party domains.
 - **No subprocess** — Date strings are generated with `datetime` instead of
