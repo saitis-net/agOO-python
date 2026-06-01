@@ -98,7 +98,7 @@ class Agoo:
         # Apply any caller-supplied overrides for the recognised keys.
         # Unknown keys are silently ignored (mirrors "# ignore the rest").
         # ----------------------------------------------------------------
-        for key in ("base_url", "start_url", "login", "password", "debug", "io_size"):
+        for key in ("base_url", "start_url", "login", "user", "password", "debug", "io_size"):
             if key in cfg:
                 self._config[key] = cfg[key]
 
