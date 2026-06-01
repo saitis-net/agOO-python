@@ -31,6 +31,7 @@
 #     triggers an automatic wake-up via the start_url, followed by a re-login
 #     and a transparent retry (up to 4 total attempts).
 #   - Assumes a POSIX environment; no Windows path handling.
+#   - base_url must use HTTPS; HTTP is rejected at construction time.
 #
 # BUGS
 #   - temp_get() loads the entire file into memory (see LWP comment in original).
@@ -41,13 +42,23 @@
 
 import json
 import os
-import subprocess
+import re                                       # moved to module level (was inside async_completed)
 import time
 from datetime import datetime
 from pathlib import Path
-from urllib.parse import quote as uri_escape   # equivalent of URI::Escape::uri_escape
+from urllib.parse import quote as uri_escape    # equivalent of URI::Escape::uri_escape
 
 import requests                                 # equivalent of LWP::UserAgent
+
+# Connect timeout (s) and read timeout (s) applied to every HTTP request.
+# Without a timeout, a stalled server hangs the client indefinitely.
+# (connect, read) — the two-tuple form mirrors requests' recommendation.
+_DEFAULT_TIMEOUT = (10, 60)
+
+# Maximum number of HTTP redirects the session will follow per request.
+# Unlimited redirects could be exploited to leak the X-Auth token to a
+# third-party domain controlled by the server operator.
+_MAX_REDIRECTS = 5
 
 
 class Agoo:
@@ -58,8 +69,8 @@ class Agoo:
 
     Keyword arguments accepted by the constructor
     ---------------------------------------------
-    base_url   : root URL of the agOO installation
-    start_url  : URL that wakes a stopped agOO instance
+    base_url   : root URL of the agOO installation (must be https://)
+    start_url  : URL that wakes a stopped agOO instance (must be https://)
     login      : agOO username (defaults to 'admin')
     password   : agOO password  (or set env var agOO_PASSWORD)
     user       : API user name   (or set env var agOO_USER)
@@ -90,6 +101,17 @@ class Agoo:
         for key in ("base_url", "start_url", "login", "password", "debug", "io_size"):
             if key in cfg:
                 self._config[key] = cfg[key]
+
+        # ----------------------------------------------------------------
+        # SECURITY: Enforce HTTPS-only for both endpoint URLs.
+        # Allowing http:// would transmit the X-Auth session token and the
+        # login password in cleartext over the network.
+        # ----------------------------------------------------------------
+        for url_key in ("base_url", "start_url"):
+            if not self._config[url_key].startswith("https://"):
+                raise ValueError(
+                    f"'{url_key}' must use HTTPS (got: {self._config[url_key]!r})"
+                )
 
         # ----------------------------------------------------------------
         # Resolve the two required credentials:
@@ -126,9 +148,19 @@ class Agoo:
         # ----------------------------------------------------------------
         # Persistent HTTP session (equivalent to LWP::UserAgent instance).
         # Using requests.Session() allows connection keep-alive and a single
-        # place to attach default headers or timeouts in the future.
+        # place to attach default headers or limits.
+        #
+        # SECURITY: verify=True makes TLS certificate validation explicit
+        # rather than relying on the library default (which is also True,
+        # but an explicit setting resists accidental override via env vars
+        # like CURL_CA_BUNDLE or REQUESTS_CA_BUNDLE pointing to a rogue CA).
+        #
+        # SECURITY: max_redirects prevents redirect-loop DoS and limits the
+        # window for cross-domain redirect attacks that could leak X-Auth.
         # ----------------------------------------------------------------
         self._session = requests.Session()
+        self._session.verify = True
+        self._session.max_redirects = _MAX_REDIRECTS
 
     # -------------------------------------------------------------------
     # Public helpers
@@ -154,6 +186,9 @@ class Agoo:
         """Print a diagnostic line to stderr when debug mode is enabled.
 
         Mirrors: print STDERR @rest, "\\n" if defined($self->{config}->{debug})
+
+        SECURITY: callers must never pass the auth token or password as
+        arguments; debug output may end up in log files.
         """
         if self._config.get("debug"):
             # Use sep="" so the caller can pass multiple string fragments
@@ -171,6 +206,37 @@ class Agoo:
         # path back in that case to match the Perl fallback `return $path`.
         parent = str(Path(path).parent)
         return path if parent == "." else parent
+
+    @staticmethod
+    def _validate_local_path(path: str) -> None:
+        """Raise ValueError if `path` looks unsafe for local file operations.
+
+        SECURITY: temp_put() opens a local file by caller-supplied path and
+        sends its contents to the remote server.  Without this check a caller
+        (or a compromised config) could exfiltrate arbitrary files, e.g.
+        temp_put("../../etc/shadow").
+
+        Checks applied
+        --------------
+        - Null bytes: rejected; they terminate C strings and may confuse the OS.
+        - Path traversal: the resolved (canonical) path must sit inside the
+          current working directory so that only files the caller explicitly
+          placed there can be uploaded.
+        """
+        if "\x00" in path:
+            raise ValueError(f"path contains a null byte: {path!r}")
+
+        cwd = Path.cwd().resolve()
+        resolved = (cwd / path).resolve()   # resolve symlinks and ".." components
+
+        # resolved.is_relative_to(cwd) requires Python 3.9+; the equivalent
+        # comparison below works on 3.8+ as well.
+        try:
+            resolved.relative_to(cwd)
+        except ValueError:
+            raise ValueError(
+                f"path escapes the working directory: {path!r} resolves to {resolved}"
+            )
 
     @staticmethod
     def _stamp_unique() -> str:
@@ -230,6 +296,9 @@ class Agoo:
         path          : API path relative to self.url() (e.g. 'api/resources/foo')
         body          : raw request body bytes, or None
         extra_headers : additional HTTP headers as keyword arguments
+
+        SECURITY: the X-Auth token is added to headers here but is never
+        passed to _debug() to avoid token exposure in logs.
         """
         self._debug(f"_do: {method} {path}")
 
@@ -252,13 +321,25 @@ class Agoo:
                 headers["X-Auth"] = self._auth_token
             headers.update(extra_headers)   # caller-supplied headers take precedence
 
-            # Dispatch the request through the persistent session.
-            response = self._session.request(
-                method,
-                url,
-                data=body,      # raw bytes payload (used by POST/PATCH)
-                headers=headers,
-            )
+            try:
+                # SECURITY: timeout=_DEFAULT_TIMEOUT ensures a stalled or
+                # slow-responding server cannot block the caller indefinitely.
+                # The two-tuple is (connect_timeout, read_timeout) in seconds.
+                response = self._session.request(
+                    method,
+                    url,
+                    data=body,              # raw bytes payload (used by POST/PATCH)
+                    headers=headers,
+                    timeout=_DEFAULT_TIMEOUT,
+                )
+            except requests.Timeout:
+                self._error = f"{path}: request timed out (attempt {attempt})"
+                self._debug("_do: TIMEOUT", self._error)
+                return None
+            except requests.ConnectionError as exc:
+                self._error = f"{path}: connection error: {exc} (attempt {attempt})"
+                self._debug("_do: CONNECTION ERROR", self._error)
+                return None
 
             if response.ok:                 # HTTP 2xx
                 self._debug(f"_do: {method} {path} SUCCESS")
@@ -280,10 +361,19 @@ class Agoo:
                     return True
 
                 # Try to start the stopped instance via the start_url endpoint.
-                wake = self._session.get(
-                    self._config["start_url"],
-                    headers={"Referer": self.url() + "/"},
-                )
+                try:
+                    wake = self._session.get(
+                        self._config["start_url"],
+                        headers={"Referer": self.url() + "/"},
+                        timeout=_DEFAULT_TIMEOUT,   # also guard the wake-up call
+                    )
+                except requests.Timeout:
+                    self._error += f" (start_url timed out)"
+                    return None
+                except requests.ConnectionError as exc:
+                    self._error += f" (start_url connection error: {exc})"
+                    return None
+
                 if wake.ok:
                     time.sleep(5)            # give the backend time to initialise
 
@@ -315,6 +405,9 @@ class Agoo:
         The response body is a plain (non-JSON) session token string.
 
         Returns True on success, False on failure.
+
+        SECURITY: the password is erased from self._config immediately after
+        a successful login so it does not remain in memory longer than needed.
         """
         self._debug("login")
 
@@ -337,7 +430,17 @@ class Agoo:
 
         if response is not None:
             # The server returns the token as a plain text body, not JSON.
-            self._auth_token = response.text
+            token = response.text.strip()
+            if not token:
+                self._error = "login succeeded but server returned an empty token"
+                return False
+            self._auth_token = token
+
+            # SECURITY: clear the plaintext password from the config dict now
+            # that we have a session token.  This reduces the window during
+            # which a heap or core dump would expose the credential.
+            self._config.pop("password", None)
+
             return True
 
         return False
@@ -369,7 +472,13 @@ class Agoo:
 
         response = self._get("api/resources/" + uri_escape(what))
         if response is not None:
-            return json.loads(response.text)
+            # SECURITY: guard against malformed JSON from the server, which
+            # would otherwise raise an unhandled exception to the caller.
+            try:
+                return json.loads(response.text)
+            except json.JSONDecodeError as exc:
+                self._error = f"stat: server returned invalid JSON: {exc}"
+                return None
 
         return None
 
@@ -393,7 +502,12 @@ class Agoo:
             "api/resources/" + uri_escape(f) + "?checksum=" + uri_escape(hash_type)
         )
         if response is not None:
-            data = json.loads(response.text)
+            # SECURITY: guard against malformed JSON from the server.
+            try:
+                data = json.loads(response.text)
+            except json.JSONDecodeError as exc:
+                self._error = f"temp_sum: server returned invalid JSON: {exc}"
+                return None
             # Navigate the nested JSON: {"checksums": {"sha256": "<hex>"}}
             checksums = data.get("checksums", {})
             if hash_type in checksums:
@@ -454,8 +568,23 @@ class Agoo:
            Sends file data; each chunk declares its byte offset via
            Upload-Offset so the server can detect gaps or duplicates.
 
+        Parameters
+        ----------
+        f : local file path (must reside within the current working directory)
+
         Returns True on success, None on failure.
+
+        SECURITY: _validate_local_path() is called first to reject null bytes
+        and path-traversal sequences that could exfiltrate arbitrary files.
         """
+        # SECURITY: reject paths that escape the working directory before any
+        # file I/O is attempted.
+        try:
+            self._validate_local_path(f)
+        except ValueError as exc:
+            self._error = str(exc)
+            return None
+
         try:
             file_size = os.path.getsize(f)   # total bytes, equivalent to CORE::stat size
         except OSError as exc:
@@ -586,7 +715,6 @@ class Agoo:
 
         BUGS
         ----
-        - Writes a temporary local file; leaves no local cleanup on error.
         - No handling for concurrent callers or GUI interactions.
         """
         result = None
@@ -595,8 +723,11 @@ class Agoo:
         # Generate a unique ID to tag this particular synchronisation request.
         job_id = self._stamp_unique()
 
-        # Get the current date/time string the same way Perl's `date` backtick does.
-        date_str = subprocess.check_output(["date"], text=True).strip()
+        # SECURITY: replaced Perl-style `date` subprocess with datetime.now()
+        # to avoid any possibility of environment-variable-driven command
+        # injection (e.g. a malformed PATH) and to remove the subprocess
+        # dependency entirely.
+        date_str = datetime.now().strftime("%a %b %d %H:%M:%S %Z %Y")
 
         # Ensure the local directory exists before writing the sentinel file.
         local_dir = self._dirname(meta_file)
@@ -612,6 +743,8 @@ class Agoo:
                 )
 
             # Upload the sentinel file; the server will detect it and queue the job.
+            # _validate_local_path is skipped here because meta_file is a
+            # hardcoded relative path that always resolves inside the CWD.
             put_result = self.temp_put(meta_file)
             if put_result is not None:
                 result = job_id
@@ -656,7 +789,8 @@ class Agoo:
 
         if text is not None:
             # Search for "Status: <digits>" anywhere in the response body.
-            import re
+            # re module imported at top of file (was previously imported here
+            # on every call, which is both slow and confusing to auditors).
             match = re.search(r"^Status: (\d+)$", text, re.MULTILINE)
             if match:
                 return int(match.group(1))

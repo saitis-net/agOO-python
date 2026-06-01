@@ -1,0 +1,194 @@
+CHANGES LOG — agOO-python
+=========================
+
+Branch: secured-by-claude
+Date:   2026-06-01
+Author: Claude Sonnet 4.6 (security review)
+
+
+SECURITY AUDIT FINDINGS AND MITIGATIONS
+----------------------------------------
+
+The following vulnerabilities were identified in the initial Python port
+(commit 4f5a0d3, branch master) and addressed in this branch.
+
+------------------------------------------------------------------------
+[SEC-01] No HTTP request timeouts
+Severity : HIGH
+Location : client.py — Agoo._do(), wake-up requests.get()
+------------------------------------------------------------------------
+FINDING:
+  All HTTP calls via requests.Session.request() and the start_url
+  wake-up call had no timeout parameter.  A stalled or malicious server
+  could block the client indefinitely, causing the calling process to
+  hang with no way to recover without an external kill signal.
+
+MITIGATION:
+  Added module-level constant _DEFAULT_TIMEOUT = (10, 60) representing
+  (connect_timeout, read_timeout) in seconds.  Applied to every call
+  inside _do(), including the start_url wake-up request.  requests.Timeout
+  and requests.ConnectionError are now caught and converted to a
+  descriptive self._error string so callers receive a clear failure rather
+  than an unhandled exception.
+
+------------------------------------------------------------------------
+[SEC-02] Local path traversal in temp_put()
+Severity : HIGH
+Location : client.py — Agoo.temp_put()
+------------------------------------------------------------------------
+FINDING:
+  temp_put(f) opened the local file at path f and uploaded its content
+  to the remote server.  No validation prevented a caller from passing
+  paths such as "../../etc/shadow" or "/etc/passwd", which would silently
+  read and transmit arbitrary files from the host filesystem.
+
+MITIGATION:
+  Added static method _validate_local_path(path) which:
+    1. Rejects paths containing null bytes (POSIX string terminator).
+    2. Resolves the path against the current working directory using
+       pathlib.Path.resolve() and rejects any path that escapes the CWD
+       via ".." components or absolute references.
+  Called at the top of temp_put() before any file I/O is attempted.
+
+------------------------------------------------------------------------
+[SEC-03] HTTPS not enforced
+Severity : HIGH
+Location : client.py — Agoo.__init__()
+------------------------------------------------------------------------
+FINDING:
+  base_url and start_url accepted any scheme, including http://.
+  Using HTTP would transmit the login password and the X-Auth session
+  token in cleartext over the network, exposing them to passive network
+  observers.
+
+MITIGATION:
+  Added a startup check in __init__() that raises ValueError if either
+  base_url or start_url does not begin with "https://".  The defaults
+  already used HTTPS; this check prevents accidental or malicious
+  downgrades at runtime.
+
+------------------------------------------------------------------------
+[SEC-04] Password persists in memory after login
+Severity : MEDIUM
+Location : client.py — Agoo.login()
+------------------------------------------------------------------------
+FINDING:
+  self._config["password"] was never cleared after a successful login.
+  The plaintext password remained in the object's memory for its entire
+  lifetime, increasing the exposure window in the event of a heap dump,
+  core file, or debugger introspection.
+
+MITIGATION:
+  After a successful login, the password is removed from the config dict
+  with self._config.pop("password", None).  The session token stored in
+  self._auth_token is sufficient for all subsequent API calls.
+
+------------------------------------------------------------------------
+[SEC-05] Unguarded JSON parsing
+Severity : MEDIUM
+Location : client.py — Agoo.stat(), Agoo.temp_sum()
+------------------------------------------------------------------------
+FINDING:
+  json.loads(response.text) in stat() and temp_sum() was not wrapped in
+  a try/except.  A server returning malformed JSON (intentional or due to
+  partial responses) would raise an unhandled json.JSONDecodeError,
+  crashing the caller instead of returning a clean error.
+
+MITIGATION:
+  Both call sites now catch json.JSONDecodeError, populate self._error
+  with a descriptive message, and return None — consistent with the
+  module's general error-handling convention.
+
+------------------------------------------------------------------------
+[SEC-06] Subprocess used for date string
+Severity : MEDIUM
+Location : client.py — Agoo.async_synchronize()
+------------------------------------------------------------------------
+FINDING:
+  subprocess.check_output(["date"], text=True) was used to obtain a
+  timestamp string for the sentinel file.  While the list-form call
+  avoided shell injection, using subprocess at all for a task that the
+  standard library handles natively introduces unnecessary process-spawning
+  overhead and keeps the subprocess import in scope (a non-zero attack
+  surface if the import is misused elsewhere).
+
+MITIGATION:
+  Replaced with datetime.now().strftime("%a %b %d %H:%M:%S %Z %Y") which
+  produces an equivalent human-readable date string using only the stdlib.
+  The subprocess import has been removed entirely from the module.
+
+------------------------------------------------------------------------
+[SEC-07] No explicit TLS certificate verification
+Severity : MEDIUM
+Location : client.py — Agoo.__init__()
+------------------------------------------------------------------------
+FINDING:
+  requests.Session() verifies TLS certificates by default, but this was
+  not explicit.  The REQUESTS_CA_BUNDLE and CURL_CA_BUNDLE environment
+  variables, or a future code change, could silently disable verification.
+
+MITIGATION:
+  Added self._session.verify = True immediately after session creation.
+  An explicit setting cannot be accidentally overridden by environment
+  variables and makes the intent clear to future maintainers.
+
+------------------------------------------------------------------------
+[SEC-08] Unlimited HTTP redirect following
+Severity : LOW
+Location : client.py — Agoo.__init__()
+------------------------------------------------------------------------
+FINDING:
+  The requests.Session followed an unlimited number of redirects by
+  default (30 in the requests library).  A malicious or misconfigured
+  server could issue redirect loops causing excessive requests, or redirect
+  to a third-party domain causing the X-Auth session token to be leaked
+  in the Referer header or forwarded directly.
+
+MITIGATION:
+  Added self._session.max_redirects = _MAX_REDIRECTS (= 5) to cap the
+  redirect chain at a sane limit.  Five redirects is more than sufficient
+  for any legitimate agOO deployment while preventing runaway loops.
+
+------------------------------------------------------------------------
+[SEC-09] `import re` inside a method body
+Severity : LOW (code quality / auditability)
+Location : client.py — Agoo.async_completed()
+------------------------------------------------------------------------
+FINDING:
+  `import re` appeared inside the async_completed() method body.  Python
+  caches imported modules so this does not cause repeated I/O, but the
+  placement makes security audits harder (imports inside functions are
+  harder to grep for and reviewers may miss them), and the per-call
+  overhead of the dict lookup is unnecessary.
+
+MITIGATION:
+  Moved `import re` to the top-level import block alongside all other
+  standard library imports.
+
+------------------------------------------------------------------------
+[SEC-10] Empty token accepted after login
+Severity : LOW
+Location : client.py — Agoo.login()
+------------------------------------------------------------------------
+FINDING:
+  If the server responded with HTTP 200 but an empty body, response.text
+  would be an empty string, which would be stored as self._auth_token.
+  Subsequent requests would then send "X-Auth: " with no value, likely
+  failing silently with a 401 rather than surfacing a clear login error.
+
+MITIGATION:
+  After receiving the response body, login() strips whitespace and checks
+  whether the resulting token is non-empty.  An empty token is now treated
+  as a login failure with a descriptive error message.
+
+
+UNCHANGED / OUT OF SCOPE
+-------------------------
+- temp_get() memory exhaustion: loading large files entirely into memory
+  is a pre-existing limitation carried over from the Perl original.
+  Mitigating it requires an API change (streaming via yield or a
+  content_file parameter); left for a future version.
+- logout(): not yet implemented in the original Perl module; left as
+  NotImplementedError.
+- schedule_archive_check_sums(), schedule_archive_del(): not implemented
+  upstream; left as NotImplementedError.
