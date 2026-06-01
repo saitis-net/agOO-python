@@ -215,12 +215,53 @@ ALGORITHM:
   batch_put() for all uploads (single-file case is handled as a degenerate
   batch of one with no sync cycle).
 
+------------------------------------------------------------------------
+[FEAT-02] Fix temp_get() memory exhaustion; add temp_get_file()
+Severity : N/A (bug fix + new feature)
+Location : client.py — Agoo._do(), Agoo._get_stream(),
+                        Agoo.temp_get(), Agoo.temp_get_file()
+           scripts/download.py
+------------------------------------------------------------------------
+PROBLEM:
+  temp_get() called self._get() which used requests' default behaviour of
+  downloading the entire HTTP response body into memory before returning.
+  For large remote files this could exhaust available RAM, causing the
+  process to be killed by the OS OOM killer or to page swap heavily.
+  The issue was noted as a known limitation since the initial port.
+
+SOLUTION — three-layer fix:
+
+  1. _do() gains a `stream: bool = False` parameter.
+     When True, `stream=True` is passed to requests.Session.request() so
+     the response body is NOT buffered — the caller drives consumption via
+     response.iter_content().
+
+  2. _get_stream() — new private method.
+     Wraps _do("GET", ..., stream=True) so the streaming path goes through
+     the same retry / 502-recovery / timeout / auth logic as regular GETs.
+
+  3. temp_get() rewritten with a hard memory cap (default 10 MiB).
+     Now uses _get_stream() internally.  The cap is enforced in two stages:
+       a. Fast path: if the server provides Content-Length and it exceeds
+          max_bytes, the connection is closed immediately (zero body bytes
+          read).
+       b. Streaming path: chunks are accumulated until the running total
+          exceeds max_bytes, at which point the connection is closed and an
+          error returned.
+     Suitable for small files (status blobs, metadata).  Returns str.
+
+  4. temp_get_file(f, local_path, chunk_size=8 MiB) — new public method.
+     Streams the response body directly to a local file, one chunk at a
+     time.  Peak memory usage is bounded by chunk_size regardless of file
+     size.  No memory cap — designed for arbitrarily large files.
+     Returns True / None.
+
+  5. download.py rewritten to use temp_get_file() with argparse.
+     Added --chunk-size option.  Cleans up the partial local file on
+     download failure.  Removed the surrogateescape encoding workaround
+     (no longer needed since the body is written as raw bytes).
+
 UNCHANGED / OUT OF SCOPE
--------------------------
-- temp_get() memory exhaustion: loading large files entirely into memory
-  is a pre-existing limitation carried over from the Perl original.
-  Mitigating it requires an API change (streaming via yield or a
-  content_file parameter); left for a future version.
 - logout(): not yet implemented in the original Perl module; left as
   NotImplementedError.
 - schedule_archive_check_sums(), schedule_archive_del(): not implemented

@@ -269,6 +269,19 @@ class Agoo:
     def _get(self, path: str, **headers):
         return self._do("GET", path, **headers)
 
+    def _get_stream(self, path: str, **headers):
+        """Like _get() but instructs requests not to buffer the response body.
+
+        Returns the response object with stream=True so the caller can
+        consume the body incrementally via response.iter_content().  The
+        caller is responsible for calling response.close() when done so
+        the underlying TCP connection is returned to the pool.
+
+        Used by temp_get() (for the memory-capped small-file path) and
+        temp_get_file() (for the disk-streaming large-file path).
+        """
+        return self._do("GET", path, stream=True, **headers)
+
     def _post(self, path: str, body=None, **headers):
         return self._do("POST", path, body=body, **headers)
 
@@ -278,7 +291,8 @@ class Agoo:
     def _delete(self, path: str, **headers):
         return self._do("DELETE", path, **headers)
 
-    def _do(self, method: str, path: str, body=None, **extra_headers):
+    def _do(self, method: str, path: str, body=None,
+            stream: bool = False, **extra_headers):
         """Execute an authenticated HTTP request with automatic retry.
 
         Retry logic (mirrors the Perl `foreach my $attempt (qw/one two three four/)`)
@@ -295,6 +309,9 @@ class Agoo:
         method        : HTTP verb in uppercase ('GET', 'POST', ...)
         path          : API path relative to self.url() (e.g. 'api/resources/foo')
         body          : raw request body bytes, or None
+        stream        : if True, the response body is NOT downloaded immediately;
+                        the caller must iterate response.iter_content() and call
+                        response.close() when done.  Default False.
         extra_headers : additional HTTP headers as keyword arguments
 
         SECURITY: the X-Auth token is added to headers here but is never
@@ -325,12 +342,18 @@ class Agoo:
                 # SECURITY: timeout=_DEFAULT_TIMEOUT ensures a stalled or
                 # slow-responding server cannot block the caller indefinitely.
                 # The two-tuple is (connect_timeout, read_timeout) in seconds.
+                #
+                # stream=True tells requests not to download the body
+                # immediately; the caller must iterate iter_content() instead.
+                # When stream=False (the default) requests buffers the full
+                # body before returning, which is fine for small responses.
                 response = self._session.request(
                     method,
                     url,
                     data=body,              # raw bytes payload (used by POST/PATCH)
                     headers=headers,
                     timeout=_DEFAULT_TIMEOUT,
+                    stream=stream,
                 )
             except requests.Timeout:
                 self._error = f"{path}: request timed out (attempt {attempt})"
@@ -941,19 +964,170 @@ class Agoo:
         )
         return True
 
-    def temp_get(self, f: str) -> str | None:
-        """Download the content of a file from temp storage.
+    def temp_get(self, f: str,
+                 max_bytes: int = 10 * 1024 * 1024) -> str | None:
+        """Download a small file from temp storage and return its text content.
 
-        WARNING: the entire file is loaded into memory.  For large files use
-        the streaming variant described in the original TODO (requests stream=True).
+        This method is designed for small files — status blobs, metadata,
+        short text documents.  It enforces a hard memory cap (max_bytes) and
+        will refuse to return content that exceeds it.
 
-        Returns the decoded text content, or None on failure.
+        For large or binary files use temp_get_file() instead, which streams
+        the response body directly to disk without any memory limit.
+
+        How the memory cap is enforced
+        -------------------------------
+        The download uses HTTP streaming (stream=True) so that the response
+        body is consumed in small chunks rather than downloaded all at once:
+
+          1. If the server sends a Content-Length header that already exceeds
+             max_bytes, the connection is closed immediately — no body bytes
+             are read at all.
+          2. Otherwise, chunks are accumulated as they arrive.  If the running
+             total exceeds max_bytes mid-stream the connection is closed and an
+             error is returned.
+
+        This two-stage approach handles both honest servers (that advertise
+        size up-front) and chunked/streaming responses (that do not).
+
+        Parameters
+        ----------
+        f         : remote path of the file to download.
+        max_bytes : maximum bytes to load into memory (default 10 MiB).
+                    Raise this for legitimate small-file use cases; switch to
+                    temp_get_file() for anything that might be large.
+
+        Returns the decoded UTF-8 text on success, None on failure.
         """
-        response = self._get("api/raw/" + uri_escape(f))
-        if response is not None:
-            return response.text   # decoded_content equivalent
+        response = self._get_stream("api/raw/" + uri_escape(f))
+        if response is None:
+            return None
 
-        return None
+        # ------------------------------------------------------------------
+        # Stage 1: fast rejection via Content-Length header.
+        #
+        # If the server declares the size up-front we can close the
+        # connection immediately without reading a single body byte.
+        # ------------------------------------------------------------------
+        content_length_header = response.headers.get("Content-Length")
+        if content_length_header is not None:
+            try:
+                declared_size = int(content_length_header)
+                if declared_size > max_bytes:
+                    response.close()   # release connection back to the pool
+                    self._error = (
+                        f"temp_get: '{f}' is {declared_size:,} bytes, which exceeds "
+                        f"the {max_bytes:,}-byte in-memory limit. "
+                        f"Use temp_get_file() to download large files to disk."
+                    )
+                    return None
+            except ValueError:
+                pass   # malformed header; fall through to the streaming read
+
+        # ------------------------------------------------------------------
+        # Stage 2: chunk-by-chunk read with a running total check.
+        #
+        # 65 536 bytes per chunk is a common network buffer size that
+        # balances per-iteration overhead against granularity of the check.
+        # ------------------------------------------------------------------
+        chunks: list[bytes] = []
+        total_read = 0
+
+        try:
+            for chunk in response.iter_content(chunk_size=65536):
+                if not chunk:
+                    continue   # keep-alive / empty delimiter chunk
+
+                total_read += len(chunk)
+                if total_read > max_bytes:
+                    # Close before returning so the server-side connection is
+                    # not left open waiting for an unread response body.
+                    response.close()
+                    self._error = (
+                        f"temp_get: '{f}' exceeded the {max_bytes:,}-byte in-memory "
+                        f"limit after receiving {total_read:,} bytes. "
+                        f"Use temp_get_file() to download large files to disk."
+                    )
+                    return None
+
+                chunks.append(chunk)
+        finally:
+            response.close()   # always return the connection to the pool
+
+        raw = b"".join(chunks)
+
+        # Decode as UTF-8 using surrogateescape so that arbitrary byte
+        # sequences do not raise — this mirrors the original response.text
+        # behaviour used before streaming was introduced.
+        return raw.decode("utf-8", errors="surrogateescape")
+
+    def temp_get_file(self, f: str, local_path: str,
+                      chunk_size: int = 8 * 1024 * 1024) -> bool | None:
+        """Download a file from temp storage, streaming directly to disk.
+
+        Unlike temp_get(), this method never loads the response body into
+        memory.  The body arrives from the network in chunks and each chunk
+        is written to disk before the next one is requested, so memory usage
+        stays bounded by chunk_size regardless of how large the file is.
+
+        This is the correct method for:
+          - Files whose size is unknown or potentially large.
+          - Binary files (archives, images, databases, …).
+          - Any context where memory exhaustion is a concern.
+
+        Use temp_get() only for small, known-size text blobs (e.g. status
+        files, short metadata documents).
+
+        Parameters
+        ----------
+        f          : remote path of the file to download.
+        local_path : local filesystem path to write the downloaded data to.
+                     The file is created if it does not exist and truncated
+                     if it does (i.e. existing content is overwritten).
+        chunk_size : number of bytes requested from the network per iteration
+                     (default 8 MiB).  The actual chunk may be smaller if the
+                     server delivers data in smaller pieces.  Tune upward for
+                     fast local storage, downward for constrained memory.
+
+        Returns True on success, None on failure (self.error() set).
+        """
+        response = self._get_stream("api/raw/" + uri_escape(f))
+        if response is None:
+            return None
+
+        bytes_written = 0
+        try:
+            # Open in binary mode — the response body is raw bytes.
+            # We write exactly what the server sends, preserving binary
+            # content faithfully without any encoding/decoding step.
+            with open(local_path, "wb") as fh:
+                for chunk in response.iter_content(chunk_size=chunk_size):
+                    if not chunk:
+                        continue   # skip keep-alive delimiter chunks
+
+                    fh.write(chunk)
+                    bytes_written += len(chunk)
+
+                    # Log progress so callers with debug=True can watch large
+                    # downloads proceed without silence.
+                    self._debug(
+                        f"temp_get_file: '{f}' — {bytes_written:,} bytes written…"
+                    )
+
+        except OSError as exc:
+            # Disk-write failure (permission denied, no space left, etc.).
+            self._error = f"temp_get_file: error writing '{local_path}': {exc}"
+            return None
+        finally:
+            # Always close the response so the TCP connection is returned to
+            # the pool, even if an exception is raised mid-download.
+            response.close()
+
+        self._debug(
+            f"temp_get_file: '{f}' → '{local_path}' "
+            f"({bytes_written:,} bytes, chunk_size={chunk_size:,})"
+        )
+        return True
 
     def temp_del(self, f: str):
         """Delete a file from temp storage.

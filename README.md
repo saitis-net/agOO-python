@@ -130,7 +130,8 @@ provided falls back to its default value or environment variable.
 | `temp_put(path) → bool \| None` | Upload a single local file using TUS resumable upload; checks available space first. |
 | `batch_put(files, poll_interval=30) → bool \| None` | Upload a list of files, automatically splitting into batches and running sync cycles when the combined size exceeds available cache space. |
 | `temp_put_fake(path)` | Create an empty placeholder file on the server. |
-| `temp_get(path) → str \| None` | Download a remote file's content as a string. |
+| `temp_get(path, max_bytes=10MiB) → str \| None` | Download a **small** file into memory (hard cap enforced). Use for status blobs and metadata only. |
+| `temp_get_file(path, local_path, chunk_size=8MiB) → bool \| None` | Stream a file of any size directly to disk with bounded memory use. |
 | `temp_del(path)` | Delete a file from temp storage. |
 | `temp_sum(path, hash_type) → str \| None` | Retrieve a checksum for a remote file. |
 
@@ -224,9 +225,10 @@ python scripts/upload.py --poll-interval 60 data/*.tar.gz
 
 ## Known limitations
 
-- `temp_get()` loads the entire remote file into memory.  This is a limitation
-  inherited from the original Perl implementation.  For large files, a future
-  streaming variant using `requests` `stream=True` is recommended.
+- `temp_get()` now enforces a hard memory cap (default 10 MiB) and will refuse
+  to return content larger than that limit.  Use `temp_get_file()` for large or
+  binary files — it streams directly to disk with memory usage bounded by
+  `chunk_size` (default 8 MiB).
 - `logout()`, `system_stats()`, `schedule_archive_check_sums()`, and
   `schedule_archive_del()` are not yet implemented upstream.
 
