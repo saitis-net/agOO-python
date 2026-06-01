@@ -816,7 +816,7 @@ class Agoo:
             return None
 
         for f, size in file_entries:
-            if size > total_cache:
+            if size > 0.9 * total_cache:
                 self._error = (
                     f"batch_put: '{f}' ({size:,} bytes) exceeds the total cache "
                     f"capacity ({total_cache:,} bytes) and can never be uploaded"
