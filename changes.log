@@ -188,6 +188,33 @@ MITIGATION:
   as a login failure with a descriptive error message.
 
 
+------------------------------------------------------------------------
+[FEAT-01] Batch upload with automatic sync cycles
+Severity : N/A (new feature)
+Location : client.py — Agoo.batch_put()
+           scripts/upload.py
+------------------------------------------------------------------------
+DESCRIPTION:
+  Added batch_put(files, poll_interval=30) to handle uploads where the
+  combined file sizes exceed available cache space.
+
+ALGORITHM:
+  1. Validate all local paths and collect sizes up-front (no network I/O).
+  2. Reject any file whose size alone exceeds total cache capacity.
+  3. At the start of each batch, call get_usage() to measure available space.
+  4. Greedily assign files (in original order) to the current batch until
+     the next file would overflow available space; defer the rest.
+  5. Upload each file in the batch via temp_put() (which performs its own
+     per-file space check as a safety net).
+  6. If deferred files remain, call async_synchronize() and poll
+     async_completed() every poll_interval seconds until the sync job
+     finishes (status 0), then return to step 3.
+  7. Fail explicitly if no files fit after a sync (cache not reclaimed).
+
+  upload.py updated to accept multiple file arguments and delegate to
+  batch_put() for all uploads (single-file case is handled as a degenerate
+  batch of one with no sync cycle).
+
 UNCHANGED / OUT OF SCOPE
 -------------------------
 - temp_get() memory exhaustion: loading large files entirely into memory

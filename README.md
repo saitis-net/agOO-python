@@ -125,8 +125,10 @@ provided falls back to its default value or environment variable.
 
 | Method | Description |
 |---|---|
+| `get_usage() → dict \| None` | Fetch cache and archive usage statistics. |
 | `stat(path) → dict \| None` | Retrieve file metadata as a dict. |
-| `temp_put(path) → bool \| None` | Upload a local file using TUS resumable upload. |
+| `temp_put(path) → bool \| None` | Upload a single local file using TUS resumable upload; checks available space first. |
+| `batch_put(files, poll_interval=30) → bool \| None` | Upload a list of files, automatically splitting into batches and running sync cycles when the combined size exceeds available cache space. |
 | `temp_put_fake(path)` | Create an empty placeholder file on the server. |
 | `temp_get(path) → str \| None` | Download a remote file's content as a string. |
 | `temp_del(path)` | Delete a file from temp storage. |
@@ -193,6 +195,32 @@ See `changes.log` for full details of the audit findings and mitigations.
   spawning a shell process.
 
 ---
+
+## Batch uploads
+
+When uploading more data than fits in the cache in one go, use `batch_put()`:
+
+```python
+files = ["backup1.tar.gz", "backup2.tar.gz", "backup3.tar.gz"]
+result = client.batch_put(files, poll_interval=30)
+if result is None:
+    print(f"Failed: {client.error()}")
+```
+
+`batch_put()` works as follows:
+
+1. Validates every path up-front (no network I/O yet).
+2. Rejects any individual file larger than the total cache capacity.
+3. Greedily fills a batch with as many files as fit in the available cache.
+4. Uploads the batch using TUS resumable upload.
+5. If files remain, calls `async_synchronize()` and polls until the archive
+   sync finishes (freeing the cache space), then repeats from step 3.
+
+The `upload.py` script accepts multiple files and uses `batch_put()` automatically:
+
+```bash
+python scripts/upload.py --poll-interval 60 data/*.tar.gz
+```
 
 ## Known limitations
 

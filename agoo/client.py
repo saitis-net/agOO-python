@@ -682,6 +682,265 @@ class Agoo:
 
         return True
 
+    def batch_put(self, files: list[str], poll_interval: int = 30) -> bool | None:
+        """Upload a list of local files, automatically batching and syncing.
+
+        Use this method when the combined size of all files may exceed the
+        available cache (temp) space.  The algorithm splits the file list into
+        batches that each fit in the available cache, uploads one batch, waits
+        for an archive sync to reclaim that cache space, then continues with
+        the next batch — repeating until every file has been uploaded.
+
+        For a single file that is already known to fit, temp_put() is simpler.
+
+        Batching algorithm (greedy, preserves file order)
+        -------------------------------------------------
+        At the start of each batch:
+          1. get_usage() is called to measure currently available cache space.
+          2. Files are considered in order.  A file is added to the current
+             batch as long as the running total of that batch would not exceed
+             available space.  Files that would overflow the batch are deferred
+             to the next batch.
+          3. Every file in the batch is uploaded with temp_put().
+          4. If deferred files remain, async_synchronize() is called to trigger
+             an archive migration of the uploaded batch, then async_completed()
+             is polled every poll_interval seconds until the job finishes.
+             The freed cache space allows the next batch to proceed.
+          5. Steps 1-4 repeat until all files have been uploaded.
+
+        A file whose size alone exceeds the total cache capacity can never be
+        uploaded; this is detected up-front and reported as a clear error.
+
+        If, after a sync, no files fit in the newly available space (i.e. the
+        server did not reclaim the expected cache), the method fails rather
+        than looping forever.
+
+        Parameters
+        ----------
+        files         : ordered list of local file paths to upload.
+        poll_interval : seconds to wait between async_completed() polls
+                        while waiting for an archive sync to finish (default 30).
+
+        Returns
+        -------
+        True  — every file was uploaded successfully.
+        None  — an error occurred; self.error() contains a description.
+        """
+
+        # ------------------------------------------------------------------
+        # Phase 1 — validate paths and collect sizes before any network I/O.
+        #
+        # Doing this up-front means we catch bad paths, missing files, and
+        # path-traversal attempts in one pass rather than discovering them
+        # mid-upload after part of the data is already on the server.
+        # ------------------------------------------------------------------
+        file_entries: list[tuple[str, int]] = []  # (local_path, size_in_bytes)
+
+        for f in files:
+            # Reject null bytes and paths that escape the working directory
+            # (delegates to the same helper used by temp_put).
+            try:
+                self._validate_local_path(f)
+            except ValueError as exc:
+                self._error = str(exc)
+                return None
+
+            try:
+                size = os.path.getsize(f)
+            except OSError as exc:
+                self._error = f"cannot stat local file '{f}': {exc}"
+                return None
+
+            file_entries.append((f, size))
+
+        if not file_entries:
+            # Nothing to do — treat as success so callers can pass empty lists.
+            return True
+
+        # ------------------------------------------------------------------
+        # Phase 2 — fetch current usage and verify that each individual file
+        # fits within the total cache capacity.
+        #
+        # This is a permanent constraint: a file larger than the total cache
+        # can never be uploaded regardless of how many sync cycles we run.
+        # Catching this now avoids an infinite loop later.
+        # ------------------------------------------------------------------
+        usage = self.get_usage()
+        if usage is None:
+            self._error = (
+                "batch_put: cannot fetch storage usage: "
+                + (self._error or "get_usage() returned no data")
+            )
+            return None
+
+        total_cache = usage.get("total")
+        if total_cache is None:
+            self._error = f"batch_put: usage response is missing 'total' field: {usage}"
+            return None
+
+        for f, size in file_entries:
+            if size > total_cache:
+                self._error = (
+                    f"batch_put: '{f}' ({size:,} bytes) exceeds the total cache "
+                    f"capacity ({total_cache:,} bytes) and can never be uploaded"
+                )
+                return None
+
+        # ------------------------------------------------------------------
+        # Phase 3 — greedy batching loop.
+        #
+        # `pending` holds the files not yet uploaded, in original order.
+        # Each iteration of the while-loop processes one batch.
+        # ------------------------------------------------------------------
+        pending = list(file_entries)   # mutable working copy
+        batch_number = 0
+
+        while pending:
+            # Re-read usage at the top of every batch so that space freed by
+            # the previous sync cycle is correctly reflected.
+            usage = self.get_usage()
+            if usage is None:
+                self._error = (
+                    "batch_put: cannot fetch storage usage at start of batch: "
+                    + (self._error or "get_usage() returned no data")
+                )
+                return None
+
+            used      = usage.get("used", 0)
+            total     = usage.get("total", 0)
+            available = total - used   # bytes free in the cache right now
+
+            self._debug(
+                f"batch_put: cache available={available:,} B  "
+                f"used={used:,}/{total:,} B  "
+                f"{len(pending)} file(s) remaining"
+            )
+
+            # ---------------------------------------------------------------
+            # Build the current batch.
+            #
+            # Walk `pending` in order and keep adding files as long as their
+            # cumulative size does not exceed `available`.  Files that do not
+            # fit are deferred to `next_pending` (the next batch).
+            #
+            # `batch_committed` tracks how many bytes are already earmarked
+            # for this batch so we don't double-count them when considering
+            # the next file.
+            # ---------------------------------------------------------------
+            current_batch: list[tuple[str, int]] = []
+            batch_committed = 0   # bytes already assigned to this batch
+            next_pending: list[tuple[str, int]] = []
+
+            for f, size in pending:
+                if batch_committed + size <= available:
+                    # This file fits in the current batch alongside everything
+                    # already assigned to it.
+                    current_batch.append((f, size))
+                    batch_committed += size
+                else:
+                    # This file would overflow the available space; defer it.
+                    next_pending.append((f, size))
+
+            if not current_batch:
+                # Nothing fit at all.  The cache was not freed after the last
+                # sync (or it was consumed by an external process).  Failing
+                # here prevents an infinite loop.
+                self._error = (
+                    f"batch_put: no files fit in available cache space "
+                    f"({available:,} bytes after sync). "
+                    f"The cache may not have been reclaimed by the server. "
+                    f"Remaining files: {[f for f, _ in pending]}"
+                )
+                return None
+
+            batch_number += 1
+            batch_total_size = sum(size for _, size in current_batch)
+            self._debug(
+                f"batch_put: starting batch {batch_number} — "
+                f"{len(current_batch)} file(s), {batch_total_size:,} bytes"
+            )
+
+            # ---------------------------------------------------------------
+            # Upload every file in the current batch via temp_put().
+            #
+            # temp_put() performs its own per-file space check (calling
+            # get_usage() again internally).  This provides a second safety
+            # net in case conditions changed between our batch-planning step
+            # above and the actual upload of each file.
+            # ---------------------------------------------------------------
+            for f, size in current_batch:
+                self._debug(
+                    f"batch_put: [{batch_number}] uploading '{f}' ({size:,} bytes)…"
+                )
+                if not self.temp_put(f):
+                    # temp_put() already populated self._error.
+                    return None
+                self._debug(f"batch_put: [{batch_number}] '{f}' uploaded OK")
+
+            self._debug(
+                f"batch_put: batch {batch_number} complete "
+                f"({len(current_batch)} file(s), {batch_total_size:,} bytes)"
+            )
+
+            # ---------------------------------------------------------------
+            # If there are more files to upload, trigger an archive sync now
+            # so the server can migrate the current batch from temp (cache)
+            # to archive storage, reclaiming cache space for the next batch.
+            #
+            # We poll async_completed() until the job finishes before
+            # proceeding to avoid starting the next batch while the cache is
+            # still full.
+            # ---------------------------------------------------------------
+            if next_pending:
+                self._debug(
+                    f"batch_put: {len(next_pending)} file(s) deferred — "
+                    f"triggering archive sync to reclaim cache space…"
+                )
+
+                job_id = self.async_synchronize()
+                if job_id is None:
+                    self._error = (
+                        "batch_put: failed to trigger archive sync: "
+                        + (self._error or "async_synchronize() returned no job ID")
+                    )
+                    return None
+
+                self._debug(f"batch_put: sync job queued — ID={job_id}")
+
+                # Poll until the server reports the job is done.
+                while True:
+                    status = self.async_completed(job_id)
+
+                    if status is None:
+                        # None means the "finished.<id>" file does not exist
+                        # yet — the job is still running.
+                        self._debug(
+                            f"batch_put: sync {job_id} still running — "
+                            f"waiting {poll_interval}s…"
+                        )
+                        time.sleep(poll_interval)
+                        continue
+
+                    # Any integer means the job completed.
+                    if status != 0:
+                        self._error = (
+                            f"batch_put: sync job {job_id} finished with "
+                            f"non-zero status {status}"
+                        )
+                        return None
+
+                    self._debug(f"batch_put: sync {job_id} completed (status 0)")
+                    break  # cache space should now be reclaimed; start next batch
+
+            # Advance to the deferred files (may be empty, ending the loop).
+            pending = next_pending
+
+        self._debug(
+            f"batch_put: all {len(file_entries)} file(s) uploaded "
+            f"in {batch_number} batch(es)"
+        )
+        return True
+
     def temp_get(self, f: str) -> str | None:
         """Download the content of a file from temp storage.
 
