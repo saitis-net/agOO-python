@@ -1,0 +1,688 @@
+# agoo/client.py
+#
+# DESCRIPTION
+#   Python port of the Perl agoo.pm support library.
+#   Provides a client for the agOO remote file-storage / archive service.
+#
+# ARCHITECTURE OVERVIEW
+#   The agOO service is a web application that manages a file hierarchy with
+#   two storage tiers:
+#     - "temp"    : fast, online storage accessible via REST API calls
+#     - "archive" : slower, tape/offline storage managed asynchronously
+#
+#   Authentication uses a session token returned by POST /api/login and then
+#   sent on every subsequent request in the custom `X-Auth` HTTP header
+#   (not a cookie, not Bearer/Basic).
+#
+#   Large file uploads use the TUS resumable-upload protocol (tus.io):
+#     1. POST  /api/tus/<path>  announces the total file length
+#     2. PATCH /api/tus/<path>  sends the payload in chunks, each chunk
+#        carrying an `Upload-Offset` header so the server can resume after
+#        a partial failure.
+#
+#   Async archive operations are triggered by uploading a small "sentinel"
+#   file (_sgbdb/archUnarchAsked) whose presence causes the backend to
+#   queue a migration job.  The caller polls for completion by checking
+#   whether a corresponding "finished.<id>" file has appeared in temp.
+#
+# NOTES
+#   - Authenticates with X-Auth header only (not cookies).
+#   - If the backend is idle it may be in a "stopped" state; a 502 response
+#     triggers an automatic wake-up via the start_url, followed by a re-login
+#     and a transparent retry (up to 4 total attempts).
+#   - Assumes a POSIX environment; no Windows path handling.
+#
+# BUGS
+#   - temp_get() loads the entire file into memory (see LWP comment in original).
+#   - No checksum support in stat() yet.
+#
+# DEPENDENCIES
+#   requests  (pip install requests)
+
+import json
+import os
+import subprocess
+import time
+from datetime import datetime
+from pathlib import Path
+from urllib.parse import quote as uri_escape   # equivalent of URI::Escape::uri_escape
+
+import requests                                 # equivalent of LWP::UserAgent
+
+
+class Agoo:
+    """Client for the agOO remote storage service.
+
+    Instantiate once, call login(), then use the temp_* / schedule_* /
+    async_* methods to interact with the service.
+
+    Keyword arguments accepted by the constructor
+    ---------------------------------------------
+    base_url   : root URL of the agOO installation
+    start_url  : URL that wakes a stopped agOO instance
+    login      : agOO username (defaults to 'admin')
+    password   : agOO password  (or set env var agOO_PASSWORD)
+    user       : API user name   (or set env var agOO_USER)
+    debug      : set to True to print diagnostic output to stderr
+    io_size    : read chunk size for uploads, in bytes (default 10 MB)
+    """
+
+    # -------------------------------------------------------------------
+    # Construction
+    # -------------------------------------------------------------------
+
+    def __init__(self, **cfg):
+        # ----------------------------------------------------------------
+        # Start with a dict of hard-coded defaults.
+        # Using a nested dict mirrors the Perl `$self->{config}` hash-ref.
+        # ----------------------------------------------------------------
+        self._config = {
+            "base_url":  "https://agoo.saitis.net",
+            "start_url": "https://agoo.saitis.net/cgi-bin/start-fb.cgi",
+            "login":     "admin",           # the agOO *username* used at login time
+            "io_size":   10 * 1024 * 1024,  # 10 MiB upload chunk size
+        }
+
+        # ----------------------------------------------------------------
+        # Apply any caller-supplied overrides for the recognised keys.
+        # Unknown keys are silently ignored (mirrors "# ignore the rest").
+        # ----------------------------------------------------------------
+        for key in ("base_url", "start_url", "login", "password", "debug", "io_size"):
+            if key in cfg:
+                self._config[key] = cfg[key]
+
+        # ----------------------------------------------------------------
+        # Resolve the two required credentials:
+        #   user     -> env var agOO_USER
+        #   password -> env var agOO_PASSWORD
+        # If neither the kwarg nor the env var is present, raise immediately
+        # so callers get a clear error at construction time rather than on
+        # the first API call.
+        # ----------------------------------------------------------------
+        auth_env = {
+            "user":     "agOO_USER",
+            "password": "agOO_PASSWORD",
+        }
+        for key, env_var in auth_env.items():
+            if key not in self._config:                   # not supplied as kwarg
+                env_value = os.environ.get(env_var)
+                if env_value is not None:
+                    self._config[key] = env_value         # fall back to env var
+                else:
+                    raise ValueError(
+                        f"you called Agoo() without setting '{key}' "
+                        f"(nor the {env_var} environment variable)"
+                    )
+
+        # ----------------------------------------------------------------
+        # Session state:
+        #   _auth_token : the opaque string returned by POST /api/login;
+        #                 None until login() is called successfully.
+        #   _error      : human-readable description of the last failure.
+        # ----------------------------------------------------------------
+        self._auth_token: str | None = None
+        self._error: str | None = None
+
+        # ----------------------------------------------------------------
+        # Persistent HTTP session (equivalent to LWP::UserAgent instance).
+        # Using requests.Session() allows connection keep-alive and a single
+        # place to attach default headers or timeouts in the future.
+        # ----------------------------------------------------------------
+        self._session = requests.Session()
+
+    # -------------------------------------------------------------------
+    # Public helpers
+    # -------------------------------------------------------------------
+
+    def url(self) -> str:
+        """Return the per-user base URL: <base_url>/<user>.
+
+        All API paths are relative to this URL.
+        """
+        # Mirrors: $self->{config}->{base_url} . '/' . $self->{config}->{user}
+        return self._config["base_url"] + "/" + self._config["user"]
+
+    def error(self) -> str | None:
+        """Return the human-readable error from the last failed operation."""
+        return self._error
+
+    # -------------------------------------------------------------------
+    # Private helpers
+    # -------------------------------------------------------------------
+
+    def _debug(self, *args) -> None:
+        """Print a diagnostic line to stderr when debug mode is enabled.
+
+        Mirrors: print STDERR @rest, "\\n" if defined($self->{config}->{debug})
+        """
+        if self._config.get("debug"):
+            # Use sep="" so the caller can pass multiple string fragments
+            # just like the Perl varargs `@rest`.
+            print("DEBUG:", *args, flush=True)
+
+    @staticmethod
+    def _dirname(path: str) -> str:
+        """Return the directory component of a path, stripping the filename.
+
+        Mirrors the Perl regex: if ($path =~ /^(.*)[/]+[^/]*$/) { return $1 }
+        Returns the path unchanged when there is no directory separator.
+        """
+        # Path.parent returns '.' for a bare filename; we want the original
+        # path back in that case to match the Perl fallback `return $path`.
+        parent = str(Path(path).parent)
+        return path if parent == "." else parent
+
+    @staticmethod
+    def _stamp_unique() -> str:
+        """Generate a timestamp + 6 random bytes expressed as a hex string.
+
+        The result is used as a unique job identifier for async operations.
+        Mirrors Crypt::URandom::urandom(6) + sprintf timestamp.
+
+        Format: YYYYMMDDHHmmss + 12 hex digits  (26 characters total)
+        """
+        # Timestamp portion: local time formatted as YYYYMMDDHHmmss
+        now = datetime.now()
+        timestamp = now.strftime("%Y%m%d%H%M%S")
+
+        # 48-bit random portion: os.urandom is the POSIX equivalent of
+        # Crypt::URandom::urandom and reads from /dev/urandom.
+        random_bytes = os.urandom(6)                  # 6 bytes = 48 bits
+        random_hex = random_bytes.hex()               # equivalent of unpack("H*", $r)
+
+        return timestamp + random_hex
+
+    # -------------------------------------------------------------------
+    # HTTP method shims
+    #
+    # Each of _get / _post / _patch / _delete is a thin wrapper around
+    # _do() that pre-fills the HTTP verb.  This mirrors the four Perl subs
+    # that each call $self->_do("verb", ...).
+    # -------------------------------------------------------------------
+
+    def _get(self, path: str, **headers):
+        return self._do("GET", path, **headers)
+
+    def _post(self, path: str, body=None, **headers):
+        return self._do("POST", path, body=body, **headers)
+
+    def _patch(self, path: str, body=None, **headers):
+        return self._do("PATCH", path, body=body, **headers)
+
+    def _delete(self, path: str, **headers):
+        return self._do("DELETE", path, **headers)
+
+    def _do(self, method: str, path: str, body=None, **extra_headers):
+        """Execute an authenticated HTTP request with automatic retry.
+
+        Retry logic (mirrors the Perl `foreach my $attempt (qw/one two three four/)`)
+        -------------------------------------------------------------------------------
+        Up to 4 attempts are made.  On a 502 (Bad Gateway) the agOO instance
+        is probably stopped; we try to wake it by hitting start_url, wait 5 s,
+        then re-authenticate before the next attempt.
+
+        Special case: a 502 on 'api/terminate' is treated as success because
+        the server may shut down before it can send a 200 response.
+
+        Parameters
+        ----------
+        method        : HTTP verb in uppercase ('GET', 'POST', ...)
+        path          : API path relative to self.url() (e.g. 'api/resources/foo')
+        body          : raw request body bytes, or None
+        extra_headers : additional HTTP headers as keyword arguments
+        """
+        self._debug(f"_do: {method} {path}")
+
+        do_login = False   # flag: re-authenticate before the next attempt
+
+        for attempt in ("one", "two", "three", "four"):
+            # Re-authenticate if the previous attempt received a 502 and the
+            # start_url wake-up succeeded.
+            if do_login:
+                self.login()   # errors are intentionally ignored here
+                do_login = False
+
+            # Build the full URL and the header dict.
+            url = self.url() + "/" + path
+
+            headers = {}
+            if self._auth_token is not None:
+                # The X-Auth header carries the opaque session token
+                # (not "Bearer <token>", just the raw token string).
+                headers["X-Auth"] = self._auth_token
+            headers.update(extra_headers)   # caller-supplied headers take precedence
+
+            # Dispatch the request through the persistent session.
+            response = self._session.request(
+                method,
+                url,
+                data=body,      # raw bytes payload (used by POST/PATCH)
+                headers=headers,
+            )
+
+            if response.ok:                 # HTTP 2xx
+                self._debug(f"_do: {method} {path} SUCCESS")
+                return response
+
+            # Request failed -- record the error with attempt metadata.
+            self._error = (
+                f"{path}: failed {response.status_code}/{response.reason}"
+                f" (attempt {attempt})"
+            )
+            self._debug("_do: FAILED", self._error)
+
+            if response.status_code == 502:
+                # 502 means the agOO backend process is not running.
+
+                if path == "api/terminate":
+                    # Termination may race the server shutdown; treat as OK.
+                    self._debug("_do: api/terminate assumed OK")
+                    return True
+
+                # Try to start the stopped instance via the start_url endpoint.
+                wake = self._session.get(
+                    self._config["start_url"],
+                    headers={"Referer": self.url() + "/"},
+                )
+                if wake.ok:
+                    time.sleep(5)            # give the backend time to initialise
+
+                    if path != "api/login":
+                        # We will need a fresh token on the next attempt.
+                        do_login = True
+                else:
+                    self._error += (
+                        f" (in addition {self._config['start_url']}"
+                        f" failed: {wake.reason})"
+                    )
+                    return None
+            else:
+                # Non-502 errors are not retried.
+                return None
+
+        # Exhausted all four attempts without success.
+        self._error += " (starting instance did not work)"
+        return None
+
+    # -------------------------------------------------------------------
+    # Authentication
+    # -------------------------------------------------------------------
+
+    def login(self) -> bool:
+        """Authenticate with the agOO service and store the session token.
+
+        Sends the credentials as JSON to POST /api/login.
+        The response body is a plain (non-JSON) session token string.
+
+        Returns True on success, False on failure.
+        """
+        self._debug("login")
+
+        # Discard any existing token before attempting a fresh login so that
+        # _do() will not send a stale X-Auth header on the login request.
+        self._auth_token = None
+
+        payload = {
+            "username":  self._config["login"],
+            "recaptcha": "",                    # field required by the form but unused
+            "password":  self._config["password"],
+        }
+
+        # POST the credentials as a JSON body.
+        response = self._post(
+            "api/login",
+            body=json.dumps(payload).encode(),
+            **{"Content-Type": "application/json"},
+        )
+
+        if response is not None:
+            # The server returns the token as a plain text body, not JSON.
+            self._auth_token = response.text
+            return True
+
+        return False
+
+    def logout(self):
+        """Log out from the agOO service.
+
+        Not yet implemented in the original Perl module.
+        The session is probably invalidated automatically when the instance stops.
+        """
+        raise NotImplementedError("logout is not yet implemented")
+
+    # -------------------------------------------------------------------
+    # Actions on temp storage (and archive metadata)
+    # -------------------------------------------------------------------
+
+    def stat(self, what: str) -> dict | None:
+        """Retrieve metadata for a file in temp or archive storage.
+
+        Parameters
+        ----------
+        what : remote path to the file
+
+        Returns a dict parsed from the JSON response, or None on failure.
+        Note: checksums are not yet included in the response (see BUGS).
+        """
+        if self._auth_token is None:
+            raise RuntimeError("call login() first")
+
+        response = self._get("api/resources/" + uri_escape(what))
+        if response is not None:
+            return json.loads(response.text)
+
+        return None
+
+    # -------------------------------------------------------------------
+    # Actions on temp storage
+    # -------------------------------------------------------------------
+
+    def temp_sum(self, f: str, hash_type: str) -> str | None:
+        """Retrieve a checksum for a file stored in temp.
+
+        Useful until stat() includes sha256 sums in its response.
+
+        Parameters
+        ----------
+        f         : remote path to the file
+        hash_type : hash algorithm name as understood by the server (e.g. 'sha256')
+
+        Returns the hex checksum string, or None on failure.
+        """
+        response = self._get(
+            "api/resources/" + uri_escape(f) + "?checksum=" + uri_escape(hash_type)
+        )
+        if response is not None:
+            data = json.loads(response.text)
+            # Navigate the nested JSON: {"checksums": {"sha256": "<hex>"}}
+            checksums = data.get("checksums", {})
+            if hash_type in checksums:
+                return checksums[hash_type]
+
+        return None
+
+    def temp_put_fake(self, f: str):
+        """Upload an empty (zero-byte) placeholder file to temp storage.
+
+        Uses the TUS resumable-upload protocol:
+          1. POST  announces Upload-Length: 0
+          2. PATCH sends the empty body
+
+        This is used when the server needs to know a file exists before its
+        content is ready (e.g. to reserve a remote path).
+
+        Returns the PATCH response object, or None on failure.
+        """
+        fake_body = b""   # zero-byte payload
+
+        # Step 1: Announce the upload (TUS initiation request).
+        response = self._post(
+            "api/tus/" + uri_escape(f) + "?override=false",
+            **{"Upload-Length": str(len(fake_body))},
+        )
+        if response is None:
+            self._error = f"could not create remote file {f}: {self._error}"
+            return None
+
+        # Step 2: Send the (empty) content (TUS PATCH request).
+        response = self._patch(
+            "api/tus/" + uri_escape(f),
+            body=fake_body,
+            **{
+                "Content-Type":   "application/offset+octet-stream",
+                "Tus-Resumable":  "1.0.0",
+                "Upload-Offset":  "0",
+            },
+        )
+        if response is None:
+            self._error = f"could not send (fake) data to remote file {f}: {self._error}"
+            return None
+
+        return response
+
+    def temp_put(self, f: str) -> bool | None:
+        """Upload a local file to temp storage using the TUS resumable protocol.
+
+        The file is read and sent in chunks of io_size bytes so that large
+        files can be uploaded without consuming excessive memory.
+
+        TUS upload sequence
+        -------------------
+        1. POST  /api/tus/<path>?override=false  with Upload-Length: <total bytes>
+           Registers the upload slot on the server.
+        2. PATCH /api/tus/<path>  (repeated for each chunk)
+           Sends file data; each chunk declares its byte offset via
+           Upload-Offset so the server can detect gaps or duplicates.
+
+        Returns True on success, None on failure.
+        """
+        try:
+            file_size = os.path.getsize(f)   # total bytes, equivalent to CORE::stat size
+        except OSError as exc:
+            self._error = f"cannot open local file {f}: {exc}"
+            return None
+
+        # --- Step 1: Announce the upload ---
+        response = self._post(
+            "api/tus/" + uri_escape(f) + "?override=false",
+            **{"Upload-Length": str(file_size)},
+        )
+        if response is None:
+            self._error = f"could not create remote file {f}: {self._error}"
+            return None
+
+        # --- Step 2: Send file content in chunks ---
+        offset = 0
+        try:
+            with open(f, "rb") as fh:
+                while True:
+                    # Read up to io_size bytes from the current file position.
+                    chunk = fh.read(self._config["io_size"])
+
+                    if not chunk:
+                        # EOF reached -- upload complete.
+                        break
+
+                    response = self._patch(
+                        "api/tus/" + uri_escape(f),
+                        body=chunk,
+                        **{
+                            "Content-Type":  "application/offset+octet-stream",
+                            "Tus-Resumable": "1.0.0",
+                            "Upload-Offset": str(offset),  # server uses this to detect gaps
+                        },
+                    )
+                    if response is None:
+                        self._error = f"could not send data to remote file {f}: {self._error}"
+                        return None
+
+                    offset += len(chunk)    # advance the logical byte offset
+
+        except OSError as exc:
+            self._error = f"read error from local file {f}: {exc}"
+            return None
+
+        return True
+
+    def temp_get(self, f: str) -> str | None:
+        """Download the content of a file from temp storage.
+
+        WARNING: the entire file is loaded into memory.  For large files use
+        the streaming variant described in the original TODO (requests stream=True).
+
+        Returns the decoded text content, or None on failure.
+        """
+        response = self._get("api/raw/" + uri_escape(f))
+        if response is not None:
+            return response.text   # decoded_content equivalent
+
+        return None
+
+    def temp_del(self, f: str):
+        """Delete a file from temp storage.
+
+        Returns the response object on success, None on failure.
+        """
+        return self._delete("api/resources/" + uri_escape(f))
+
+    # -------------------------------------------------------------------
+    # Actions on archive storage (queued until async_synchronize() is called)
+    # -------------------------------------------------------------------
+
+    def schedule_migrate(self) -> bool:
+        """Schedule a migration of temp files to archive storage.
+
+        Currently a no-op; migration is handled implicitly by the server.
+        Returns True to indicate "scheduled" (mirrors Perl `return 1`).
+        """
+        return True
+
+    def schedule_unmigrate(self, f: str):
+        """Schedule a copy of an archive file back to temp storage.
+
+        Uses a PATCH action query-parameter to request a server-side copy:
+          PATCH /api/resources/<path>?action=copy&override=true&...
+
+        Returns the response object on success, None on failure.
+        """
+        return self._patch(
+            "api/resources/" + uri_escape(f)
+            + "?action=copy&override=true&rename=false&destination=/"
+            + uri_escape(f)
+        )
+
+    def schedule_archive_check_sums(self):
+        """Check checksums for archived files.
+
+        Not yet supported by the agOO server.
+        """
+        raise NotImplementedError("schedule_archive_check_sums is not yet implemented")
+
+    def schedule_archive_del(self):
+        """Delete a file from archive storage.
+
+        Not yet implemented.
+        """
+        raise NotImplementedError("schedule_archive_del is not yet implemented")
+
+    # -------------------------------------------------------------------
+    # Archive synchronisation
+    # -------------------------------------------------------------------
+
+    def async_synchronize(self) -> str | None:
+        """Trigger an asynchronous archive migration job.
+
+        Mechanism
+        ---------
+        The agOO backend watches for the appearance of a sentinel file at
+        the well-known path `_sgbdb/archUnarchAsked`.  Uploading that file
+        is the signal that causes the backend to start a migration job.
+
+        The sentinel file contains a unique ID (generated by _stamp_unique)
+        so the caller can later check whether the job completed via
+        async_completed(id).
+
+        Returns the unique job ID string on success, or None on failure.
+
+        BUGS
+        ----
+        - Writes a temporary local file; leaves no local cleanup on error.
+        - No handling for concurrent callers or GUI interactions.
+        """
+        result = None
+        meta_file = "_sgbdb/archUnarchAsked"   # well-known sentinel path
+
+        # Generate a unique ID to tag this particular synchronisation request.
+        job_id = self._stamp_unique()
+
+        # Get the current date/time string the same way Perl's `date` backtick does.
+        date_str = subprocess.check_output(["date"], text=True).strip()
+
+        # Ensure the local directory exists before writing the sentinel file.
+        local_dir = self._dirname(meta_file)
+        os.makedirs(local_dir, exist_ok=True)   # err. ign equivalent
+
+        try:
+            with open(meta_file, "w") as fh:
+                # Write a human-readable header plus the unique ID marker.
+                # The %ID:...% pattern is parsed by the backend.
+                fh.write(
+                    f"Automatic request queued on {date_str} by {__file__}\n"
+                    f"%ID:{job_id}%\n"
+                )
+
+            # Upload the sentinel file; the server will detect it and queue the job.
+            put_result = self.temp_put(meta_file)
+            if put_result is not None:
+                result = job_id
+            else:
+                self._error = (
+                    f"{job_id} error putting meta file {meta_file}: {self._error}"
+                )
+
+        except OSError as exc:
+            self._error = f"{job_id} could not create meta file {meta_file}: {exc}"
+
+        finally:
+            # Always attempt local cleanup of the temporary sentinel file,
+            # regardless of whether the upload succeeded (mirrors `unlink`).
+            try:
+                os.unlink(meta_file)
+            except OSError:
+                pass
+
+            try:
+                os.rmdir(local_dir)   # only removes the dir if it is now empty
+            except OSError:
+                pass
+
+        return result
+
+    def async_completed(self, job_id: str) -> int | None:
+        """Poll for completion of an async archive job.
+
+        The backend writes a result file at `_sgbdb/finished.<id>` when the
+        job finishes.  Its content is expected to contain a line of the form:
+            Status: <integer>
+
+        Returns
+        -------
+        0      if the job completed successfully (Status: 0)
+        int    the non-zero status code on failure
+        255    if the finished file exists but could not be parsed
+        None   if the finished file does not exist yet (job still running)
+        """
+        text = self.temp_get(f"_sgbdb/finished.{job_id}")
+
+        if text is not None:
+            # Search for "Status: <digits>" anywhere in the response body.
+            import re
+            match = re.search(r"^Status: (\d+)$", text, re.MULTILINE)
+            if match:
+                return int(match.group(1))
+            # File exists but is malformed -- return sentinel error code 255.
+            return 255
+
+        # File does not exist yet: the job is still running (or hasn't started).
+        return None
+
+    # -------------------------------------------------------------------
+    # System / lifecycle
+    # -------------------------------------------------------------------
+
+    def system_stats(self):
+        """Retrieve system statistics (upload/download bytes, changer ops, etc.).
+
+        Not yet implemented.
+        """
+        raise NotImplementedError("system_stats is not yet implemented")
+
+    def terminate(self):
+        """Ask the agOO backend to terminate its current instance.
+
+        A 502 response is treated as success inside _do() because the server
+        may shut down before it can send a 200 reply.
+
+        Returns the response object (or True on 502) on success, None on failure.
+        """
+        return self._get("api/terminate")
