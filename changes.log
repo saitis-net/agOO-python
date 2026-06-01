@@ -1,6 +1,37 @@
 CHANGES LOG — agOO-python
 =========================
 
+------------------------------------------------------------------------
+[FEAT-04] TUS resumable upload — survive connection drops mid-upload
+Severity : N/A (reliability improvement)
+Location : client.py — Agoo._tus_get_offset(), Agoo.temp_put()
+------------------------------------------------------------------------
+PROBLEM
+  Large file uploads (2 GB EOS firmware images) were failing with a
+  write-timeout connection drop mid-PATCH.  The previous code treated any
+  PATCH failure as fatal and returned None, losing all progress on the
+  current file.
+
+CHANGE 1 — _tus_get_offset(tus_path) helper:
+  Sends a TUS HEAD request and returns the Upload-Offset the server
+  reports (how many bytes it has safely received).  Returns None when
+  the slot does not exist or the request fails.
+
+CHANGE 2 — temp_put() resume logic:
+  a. Before POSTing a new slot, HEAD is sent first.  If the server
+     already holds a partial upload (e.g. from a previous run) the
+     upload resumes from the server's reported offset, skipping bytes
+     already received.  If the server has all bytes, temp_put() returns
+     True immediately without re-uploading.
+  b. After any PATCH failure, HEAD is queried to learn the server's
+     current offset.  The upload then resumes from that offset rather
+     than restarting from zero.  Up to _TUS_MAX_RESUME (5) consecutive
+     failures are tolerated per file before giving up.
+  c. The resume counter is reset to zero after each successful chunk so
+     a file with occasional drops can still complete as long as it keeps
+     making progress.
+
+------------------------------------------------------------------------
 Branch: secured-by-claude
 Date:   2026-06-01
 Author: Claude Sonnet 4.6 (security review)

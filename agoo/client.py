@@ -297,6 +297,27 @@ class Agoo:
     def _delete(self, path: str, **headers):
         return self._do("DELETE", path, **headers)
 
+    def _tus_get_offset(self, tus_path: str) -> int | None:
+        """Query the server for the current TUS upload offset via HEAD.
+
+        Returns the number of bytes the server has already received for this
+        upload slot, or None if the slot does not exist or the request fails.
+
+        Used by temp_put() to resume an interrupted upload without restarting
+        from byte zero.
+        """
+        response = self._do("HEAD", tus_path, **{"Tus-Resumable": "1.0.0"})
+        if response is None:
+            return None
+        offset_str = response.headers.get("Upload-Offset")
+        if offset_str is None:
+            return None
+        try:
+            return int(offset_str)
+        except ValueError:
+            self._debug(f"_tus_get_offset: unexpected Upload-Offset value: {offset_str!r}")
+            return None
+
     def _do(self, method: str, path: str, body=None,
             stream: bool = False, **extra_headers):
         """Execute an authenticated HTTP request with automatic retry.
@@ -597,6 +618,11 @@ class Agoo:
 
         return response
 
+    # Maximum number of consecutive PATCH failures before temp_put() gives up.
+    # Each failure triggers a TUS HEAD to query the server's current offset and
+    # resume from there, so this counts resume attempts, not raw retries.
+    _TUS_MAX_RESUME = 5
+
     def temp_put(self, f: str) -> bool | None:
         """Upload a local file to temp storage using the TUS resumable protocol.
 
@@ -605,11 +631,19 @@ class Agoo:
 
         TUS upload sequence
         -------------------
-        1. POST  /api/tus/<path>?override=false  with Upload-Length: <total bytes>
-           Registers the upload slot on the server.
-        2. PATCH /api/tus/<path>  (repeated for each chunk)
-           Sends file data; each chunk declares its byte offset via
-           Upload-Offset so the server can detect gaps or duplicates.
+        1. HEAD  /api/tus/<path>          Check whether a partial upload already
+                                          exists.  If the server returns an
+                                          Upload-Offset header the upload resumes
+                                          from that byte; otherwise a new slot is
+                                          created with POST.
+        2. POST  /api/tus/<path>?override=false  with Upload-Length: <total bytes>
+                                          Registers the upload slot on the server
+                                          (only when no existing slot was found).
+        3. PATCH /api/tus/<path>          Sends file data starting from the
+                                          current offset.  On connection failure
+                                          the server is queried again via HEAD and
+                                          the upload resumes from its reported
+                                          offset, up to _TUS_MAX_RESUME times.
 
         Parameters
         ----------
@@ -676,44 +710,90 @@ class Agoo:
             f"margin={_CACHE_SAFETY_MARGIN * 100:.0f}%"
         )
 
-        # --- Step 1: Announce the upload ---
-        response = self._post(
-            "api/tus/" + uri_escape(f) + "?override=false",
-            **{"Upload-Length": str(file_size)},
-        )
-        if response is None:
-            self._error = f"could not create remote file {f}: {self._error}"
-            return None
+        tus_path = "api/tus/" + uri_escape(f)
 
-        # --- Step 2: Send file content in chunks ---
-        offset = 0
+        # --- Step 1: Check for an existing partial upload (TUS HEAD) ---
+        # If a previous attempt was interrupted the server may already hold
+        # some bytes.  Resume from the server's reported offset instead of
+        # restarting from zero and re-sending data the server already has.
+        offset = self._tus_get_offset(tus_path)
+
+        if offset is None:
+            # No existing slot — register a new upload.
+            response = self._post(
+                tus_path + "?override=false",
+                **{"Upload-Length": str(file_size)},
+            )
+            if response is None:
+                self._error = f"could not create remote file '{f}': {self._error}"
+                return None
+            offset = 0
+        elif offset >= file_size:
+            # The server already has all bytes (e.g. a previous run completed
+            # but the caller didn't record the result).
+            self._debug(f"temp_put: '{f}' already fully uploaded ({offset:,} bytes)")
+            return True
+        else:
+            self._debug(
+                f"temp_put: resuming '{f}' from server offset "
+                f"{offset:,} / {file_size:,} bytes"
+            )
+
+        # --- Step 2: Send file content in chunks, resuming on failure ---
+        resume_attempts = 0
         try:
             with open(f, "rb") as fh:
-                while True:
-                    # Read up to io_size bytes from the current file position.
+                fh.seek(offset)
+                while offset < file_size:
                     chunk = fh.read(self._config["io_size"])
-
                     if not chunk:
-                        # EOF reached -- upload complete.
-                        break
+                        break   # EOF — upload complete
 
                     response = self._patch(
-                        "api/tus/" + uri_escape(f),
+                        tus_path,
                         body=chunk,
                         **{
                             "Content-Type":  "application/offset+octet-stream",
                             "Tus-Resumable": "1.0.0",
-                            "Upload-Offset": str(offset),  # server uses this to detect gaps
+                            "Upload-Offset": str(offset),
                         },
                     )
-                    if response is None:
-                        self._error = f"could not send data to remote file {f}: {self._error}"
-                        return None
 
-                    offset += len(chunk)    # advance the logical byte offset
+                    if response is None:
+                        # PATCH failed (connection drop, timeout, etc.).
+                        # Query the server for how many bytes it actually kept,
+                        # then resume from there rather than restarting at zero.
+                        if resume_attempts >= self._TUS_MAX_RESUME:
+                            self._error = (
+                                f"could not send data to remote file '{f}': "
+                                f"gave up after {self._TUS_MAX_RESUME} resume attempts"
+                            )
+                            return None
+
+                        resume_attempts += 1
+                        server_offset = self._tus_get_offset(tus_path)
+                        if server_offset is not None and server_offset >= offset:
+                            self._debug(
+                                f"temp_put: PATCH failed — resuming '{f}' from "
+                                f"server offset {server_offset:,} "
+                                f"(resume {resume_attempts}/{self._TUS_MAX_RESUME})"
+                            )
+                            offset = server_offset
+                            fh.seek(offset)
+                        else:
+                            # Server has no record of the upload (slot lost).
+                            self._error = (
+                                f"could not send data to remote file '{f}': "
+                                f"{self._error} — server offset lost"
+                            )
+                            return None
+                        continue
+
+                    offset += len(chunk)
+                    resume_attempts = 0   # reset counter after each successful chunk
 
         except OSError as exc:
-            self._error = f"read error from local file {f}: {exc}"
+            self._error = f"read error from local file '{f}': {exc}"
             return None
 
         return True
