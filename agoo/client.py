@@ -719,12 +719,24 @@ class Agoo:
         offset = self._tus_get_offset(tus_path)
 
         if offset is None:
-            # No existing slot — register a new upload.
+            # No in-progress TUS slot — register a new upload.
             response = self._post(
                 tus_path + "?override=false",
                 **{"Upload-Length": str(file_size)},
             )
             if response is None:
+                # 409 Conflict means the file already exists on the server
+                # (fully uploaded in a previous run; TUS slot was cleaned up
+                # on completion so HEAD found nothing).  Verify by stat-ing
+                # the file and confirming the size matches.
+                if self._error and "409" in self._error:
+                    existing = self.stat(f)
+                    if existing and existing.get("size") == file_size:
+                        self._debug(
+                            f"temp_put: '{f}' already present on server "
+                            f"({file_size:,} bytes), skipping"
+                        )
+                        return True
                 self._error = f"could not create remote file '{f}': {self._error}"
                 return None
             offset = 0
