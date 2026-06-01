@@ -40,7 +40,6 @@
 # DEPENDENCIES
 #   requests  (pip install requests)
 
-import getpass
 import json
 import os
 import re                                       # moved to module level (was inside async_completed)
@@ -406,20 +405,6 @@ class Agoo:
         The response body is a plain (non-JSON) session token string.
 
         Returns True on success, False on failure.
-
-        Password resolution order
-        -------------------------
-        1. self._config["password"] — set at construction or via agOO_PASSWORD.
-        2. Interactive prompt via getpass.getpass() — used when the password
-           was already cleared after a previous login (SEC-04), or when the
-           caller never supplied one.  getpass reads from /dev/tty directly so
-           it works even when stdin is redirected, and it does not echo.
-
-        SECURITY: the password is held only in a local variable during this
-        call and is never written back to self._config.  self._config["password"]
-        is cleared after a successful login so it does not linger in memory.
-        If the process is non-interactive and no password is available, the
-        method returns False with a descriptive error rather than crashing.
         """
         self._debug("login")
 
@@ -427,33 +412,10 @@ class Agoo:
         # _do() will not send a stale X-Auth header on the login request.
         self._auth_token = None
 
-        # Resolve the password into a local variable so it is never written
-        # back to self._config and is freed when this function returns.
-        password = self._config.get("password")
-        if password is None:
-            # Password was cleared after a previous login (SEC-04) or was
-            # never provided.  Prompt the user interactively.
-            try:
-                password = getpass.getpass(
-                    prompt=(
-                        f"agOO password for {self._config['login']}"
-                        f"@{self._config['base_url']}: "
-                    )
-                )
-            except (EOFError, OSError) as exc:
-                # EOFError : stdin is not a tty (piped/redirected input).
-                # OSError  : /dev/tty is not accessible (container, daemon).
-                # In either case we cannot prompt, so surface a clear error.
-                self._error = (
-                    f"re-authentication required but no terminal is available "
-                    f"for an interactive password prompt: {exc}"
-                )
-                return False
-
         payload = {
             "username":  self._config["login"],
             "recaptcha": "",                    # field required by the form but unused
-            "password":  password,
+            "password":  self._config["password"],
         }
 
         # POST the credentials as a JSON body.
@@ -470,12 +432,6 @@ class Agoo:
                 self._error = "login succeeded but server returned an empty token"
                 return False
             self._auth_token = token
-
-            # SECURITY: clear the plaintext password from the config dict now
-            # that we have a session token.  The local `password` variable is
-            # discarded automatically when this function returns.
-            self._config.pop("password", None)
-
             return True
 
         return False

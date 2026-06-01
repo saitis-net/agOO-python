@@ -68,7 +68,7 @@ MITIGATION:
   downgrades at runtime.
 
 ------------------------------------------------------------------------
-[SEC-04] Password persists in memory after login
+[SEC-04] Password persists in memory after login  *** ROLLED BACK ***
 Severity : MEDIUM
 Location : client.py — Agoo.login()
 ------------------------------------------------------------------------
@@ -78,26 +78,16 @@ FINDING:
   lifetime, increasing the exposure window in the event of a heap dump,
   core file, or debugger introspection.
 
-  A secondary consequence of clearing the password (identified during
-  review of SEC-04) is that the automatic re-authentication triggered by
-  _do() on 502 retries would crash with KeyError because login() tried to
-  read self._config["password"] after it had been removed.
+MITIGATION (applied, then rolled back):
+  The password was cleared with self._config.pop("password", None) after
+  a successful login, and getpass.getpass() was used for re-authentication
+  when the password was no longer present in config.
 
-MITIGATION:
-  After a successful login, the password is removed from the config dict
-  with self._config.pop("password", None).  The session token stored in
-  self._auth_token is sufficient for all subsequent API calls.
-
-  To support transparent re-authentication without keeping the password in
-  memory, login() now resolves the credential in order:
-    1. self._config["password"] — present on the first call.
-    2. getpass.getpass() — used on all subsequent calls (interactive prompt).
-  The prompted password is held only in a local variable for the duration
-  of the function call and is never written back to self._config, so it is
-  freed as soon as login() returns.  getpass reads from /dev/tty directly,
-  preventing the password from appearing in shell history or piped input.
-  If the process is non-interactive and no password is available, login()
-  returns False with a descriptive error instead of raising KeyError.
+ROLLBACK REASON:
+  Rolled back at the maintainer's request.  self._config["password"] is
+  retained for the full lifetime of the Agoo object; re-authentication
+  triggered by _do() on 502 retries continues to read it directly.
+  SEC-10 (empty-token check) is retained independently.
 
 ------------------------------------------------------------------------
 [SEC-05] Unguarded JSON parsing
