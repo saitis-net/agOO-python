@@ -45,12 +45,13 @@ def main() -> int:
         print(f"Error: '{local_path}' is not a file or does not exist.", file=sys.stderr)
         return 1
 
+    file_size = os.path.getsize(local_path)
+
     # Instantiate the client.  `login` is the agOO username used in the login
     # form; `user` is the API namespace segment that appears in every URL.
-    # Both are "thomas" for this account.
     client = Agoo(
         user=LOGIN,
-        login=LOGIN,
+        login="admin",
         password=PASSWORD,
     )
 
@@ -59,6 +60,18 @@ def main() -> int:
         print(f"Login failed: {client.error()}", file=sys.stderr)
         return 1
     print("Authenticated.")
+
+    # Show cache usage before the upload so the operator can see headroom.
+    usage = client.get_usage()
+    if usage:
+        total     = usage.get("total", 0)
+        used      = usage.get("used", 0)
+        available = total - used
+        print(
+            f"Cache: {used:,} / {total:,} bytes used  "
+            f"({available:,} available)"
+        )
+        print(f"File:  {file_size:,} bytes")
 
     print(f"Uploading '{local_path}'…")
     result = client.temp_put(local_path)

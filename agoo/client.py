@@ -477,6 +477,29 @@ class Agoo:
     # Actions on temp storage
     # -------------------------------------------------------------------
 
+    def get_usage(self) -> dict | None:
+        """Fetch storage usage statistics from the agOO service.
+
+        Calls GET api/usage and returns a dict with the following fields:
+
+          total     : total cache (temp) space in bytes
+          used      : used cache space in bytes
+          totalArch : total archival drive size in bytes
+          usedArch  : used archival drive space in bytes
+
+        Available cache space = total - used.
+
+        Returns the parsed dict on success, or None on failure.
+        """
+        response = self._get("api/usage")
+        if response is not None:
+            try:
+                return json.loads(response.text)
+            except json.JSONDecodeError as exc:
+                self._error = f"get_usage: server returned invalid JSON: {exc}"
+                return None
+        return None
+
     def temp_sum(self, f: str, hash_type: str) -> str | None:
         """Retrieve a checksum for a file stored in temp.
 
@@ -581,6 +604,41 @@ class Agoo:
         except OSError as exc:
             self._error = f"cannot open local file {f}: {exc}"
             return None
+
+        # --- Space check: refuse early if the cache cannot fit the file ---
+        # Fetching usage before the TUS POST avoids allocating a remote slot
+        # for an upload that is guaranteed to fail or fill the cache.
+        usage = self.get_usage()
+        if usage is None:
+            self._error = (
+                f"cannot verify available cache space before uploading '{f}': "
+                + (self._error or "get_usage() returned no data")
+            )
+            return None
+
+        total = usage.get("total")
+        used  = usage.get("used")
+        if total is None or used is None:
+            # The server responded but the expected fields are absent; treat
+            # this as a fatal error rather than silently skipping the check.
+            self._error = (
+                f"get_usage: response is missing 'total' or 'used' fields: {usage}"
+            )
+            return None
+
+        available = total - used
+        if file_size > available:
+            self._error = (
+                f"insufficient cache space for '{f}': "
+                f"file is {file_size:,} bytes but only {available:,} bytes available "
+                f"({used:,} of {total:,} bytes used)"
+            )
+            return None
+
+        self._debug(
+            f"space check OK: file={file_size:,} B  "
+            f"available={available:,} B  used={used:,}/{total:,} B"
+        )
 
         # --- Step 1: Announce the upload ---
         response = self._post(
