@@ -46,7 +46,7 @@ import re                                       # moved to module level (was ins
 import time
 from datetime import datetime
 from pathlib import Path
-from urllib.parse import quote as uri_escape    # equivalent of URI::Escape::uri_escape
+from urllib.parse import quote as uri_escape, urlparse    # equivalent of URI::Escape::uri_escape
 
 import requests                                 # equivalent of LWP::UserAgent
 
@@ -65,6 +65,22 @@ _MAX_REDIRECTS = 5
 # Keeping 10% headroom avoids filling the cache completely, which could
 # interfere with server-side housekeeping that also needs cache space.
 _CACHE_SAFETY_MARGIN = 0.10
+
+
+class _SafeSession(requests.Session):
+    """requests.Session that strips X-Auth on cross-origin redirects.
+
+    requests strips the Authorization header on cross-origin redirects but
+    leaves custom headers — including X-Auth — intact.  This subclass
+    overrides rebuild_auth() to also drop X-Auth whenever the redirect
+    target has a different host than the original request, preventing the
+    session token from being forwarded to a third-party domain.
+    """
+
+    def rebuild_auth(self, prepared_request, response) -> None:
+        super().rebuild_auth(prepared_request, response)
+        if urlparse(response.url).netloc != urlparse(prepared_request.url).netloc:
+            prepared_request.headers.pop("X-Auth", None)
 
 
 class Agoo:
@@ -164,7 +180,7 @@ class Agoo:
         # SECURITY: max_redirects prevents redirect-loop DoS and limits the
         # window for cross-domain redirect attacks that could leak X-Auth.
         # ----------------------------------------------------------------
-        self._session = requests.Session()
+        self._session = _SafeSession()
         self._session.verify = True
         self._session.max_redirects = _MAX_REDIRECTS
 
@@ -243,6 +259,35 @@ class Agoo:
             raise ValueError(
                 f"path escapes the working directory: {path!r} resolves to {resolved}"
             )
+
+    @staticmethod
+    def _validate_output_path(path: str) -> None:
+        """Raise ValueError if `path` is unsafe as a local download destination.
+
+        Unlike _validate_local_path() — which rejects all paths that resolve
+        outside the CWD — this validator permits absolute paths so callers can
+        legitimately write to external mounts (e.g. /mnt/nas/backup.tar.gz).
+
+        Checks applied
+        --------------
+        - Null bytes: always rejected.
+        - Relative path traversal: a relative path must resolve within the
+          CWD (i.e. relative paths with '..' that escape the CWD are rejected).
+          Absolute paths bypass this check since the caller explicitly chose them.
+        """
+        if "\x00" in path:
+            raise ValueError(f"output path contains a null byte: {path!r}")
+
+        if not os.path.isabs(path):
+            cwd = Path.cwd().resolve()
+            resolved = (cwd / path).resolve()
+            try:
+                resolved.relative_to(cwd)
+            except ValueError:
+                raise ValueError(
+                    f"output path escapes the working directory: "
+                    f"{path!r} resolves to {resolved}"
+                )
 
     @staticmethod
     def _stamp_unique() -> str:
@@ -1215,6 +1260,15 @@ class Agoo:
 
         Returns True on success, None on failure (self.error() set).
         """
+        # SECURITY: validate the output path before any network I/O so that a
+        # caller that derives local_path from untrusted input cannot be tricked
+        # into writing to an arbitrary location (e.g. ../../.ssh/authorized_keys).
+        try:
+            self._validate_output_path(local_path)
+        except ValueError as exc:
+            self._error = str(exc)
+            return None
+
         response = self._get_stream("api/raw/" + uri_escape(f))
         if response is None:
             return None
