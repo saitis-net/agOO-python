@@ -17,14 +17,12 @@ Exits with code 0 if the job reports status 0 (success),
 
 Credentials
 -----------
-Loaded from environment variables when set, otherwise fall back to the
-defaults below.  To avoid storing the password in shell history, prefer:
+Both agOO_USER and agOO_PASSWORD environment variables must be set.
+The script exits immediately with a clear error if either is missing.
 
-    export agOO_PASSWORD=welcometoagoo
+    export agOO_USER=myuser
+    export agOO_PASSWORD=mypassword
     python scripts/sync.py
-
-WARNING: hardcoded credentials below are provided for convenience during
-development only.  Do not commit real passwords to version control.
 """
 
 import os
@@ -38,15 +36,26 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from agoo import Agoo
 
 # ---------------------------------------------------------------------------
-# Credentials — env vars take priority; literals are the fallback.
+# Credentials — must be supplied via environment variables; no fallback.
 # ---------------------------------------------------------------------------
-LOGIN    = os.environ.get("agOO_USER",     "thomas")
-PASSWORD = os.environ.get("agOO_PASSWORD", "welcometoagoo")
+LOGIN    = os.environ.get("agOO_USER")
+PASSWORD = os.environ.get("agOO_PASSWORD")
 
 # How often to poll for job completion, in seconds.
 DEFAULT_POLL_INTERVAL = 30
 
 def main() -> int:
+    # -----------------------------------------------------------------------
+    # Credential check — fail fast before touching the network.
+    # -----------------------------------------------------------------------
+    missing = [name for name, val in (("agOO_USER", LOGIN), ("agOO_PASSWORD", PASSWORD))
+               if val is None]
+    if missing:
+        for name in missing:
+            print(f"Error: environment variable {name} is not set.", file=sys.stderr)
+        print("Export agOO_USER and agOO_PASSWORD before running this script.", file=sys.stderr)
+        return 1
+
     parser = argparse.ArgumentParser(description="Trigger and wait for an agOO archive sync.")
     parser.add_argument(
         "--poll-interval",

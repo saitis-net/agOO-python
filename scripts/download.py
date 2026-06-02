@@ -41,12 +41,8 @@ Exit codes
 
 Credentials
 -----------
-Resolved in this order (first match wins):
-  1. agOO_USER / agOO_PASSWORD environment variables  (recommended for scripts)
-  2. Hard-coded defaults below                        (development convenience)
-
-WARNING: hard-coded passwords are provided for development convenience only.
-         Never commit real credentials to version control.
+Both agOO_USER and agOO_PASSWORD environment variables must be set.
+The script exits immediately with a clear error if either is missing.
 """
 
 import argparse
@@ -59,10 +55,10 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from agoo import Agoo
 
 # ---------------------------------------------------------------------------
-# Credentials — environment variables take priority over the hard-coded values.
+# Credentials — must be supplied via environment variables; no fallback.
 # ---------------------------------------------------------------------------
-_USER     = os.environ.get("agOO_USER",     "thomas")   # API namespace / user
-_PASSWORD = os.environ.get("agOO_PASSWORD", "welcometoagoo")
+_USER     = os.environ.get("agOO_USER")
+_PASSWORD = os.environ.get("agOO_PASSWORD")
 
 # Default streaming chunk size: 8 MiB.
 # This controls how many bytes are held in memory at any one time during
@@ -80,6 +76,17 @@ def _fmt_bytes(n: int) -> str:
 
 
 def main() -> int:
+    # -----------------------------------------------------------------------
+    # Credential check — fail fast before touching the network or filesystem.
+    # -----------------------------------------------------------------------
+    missing = [name for name, val in (("agOO_USER", _USER), ("agOO_PASSWORD", _PASSWORD))
+               if val is None]
+    if missing:
+        for name in missing:
+            print(f"Error: environment variable {name} is not set.", file=sys.stderr)
+        print("Export agOO_USER and agOO_PASSWORD before running this script.", file=sys.stderr)
+        return 1
+
     # -----------------------------------------------------------------------
     # Argument parsing
     # -----------------------------------------------------------------------
