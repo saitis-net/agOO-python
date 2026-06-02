@@ -223,6 +223,92 @@ The `upload.py` script accepts multiple files and uses `batch_put()` automatical
 python scripts/upload.py --poll-interval 60 data/*.tar.gz
 ```
 
+---
+
+## Scripts
+
+The `scripts/` directory contains ready-to-run command-line tools built on top of the library.
+Credentials are read from `agOO_USER` / `agOO_PASSWORD` environment variables in all scripts.
+
+### upload.py — Upload files to temp storage
+
+```
+python scripts/upload.py [--poll-interval SECONDS] <file> [<file> ...]
+```
+
+Uploads one or more local files using `batch_put()`.  When the combined size
+of all files exceeds the available cache space the script automatically batches
+the uploads and waits for an archive sync between batches.
+
+| Option | Default | Description |
+|---|---|---|
+| `--poll-interval N` | `30` | Seconds between sync-completion polls. |
+
+```bash
+# Upload a single file
+python scripts/upload.py report.tar.gz
+
+# Upload a directory glob; sync cycles fire automatically if needed
+python scripts/upload.py data/*.tar.gz
+
+# Override the poll interval for slow archive backends
+python scripts/upload.py --poll-interval 60 backup.tar
+```
+
+### download.py — Download a file from temp storage
+
+```
+python scripts/download.py [--chunk-size BYTES] <remote-path> [<local-output-path>]
+```
+
+Streams a file from agOO temp storage to disk one chunk at a time.  Peak
+memory usage is bounded by `--chunk-size` regardless of file size.  The script
+refuses to overwrite an existing local file.
+
+| Argument | Description |
+|---|---|
+| `remote-path` | Path to the file in agOO temp storage. |
+| `local-output-path` | Where to save the file locally (default: basename of remote path in the current directory). |
+
+| Option | Default | Description |
+|---|---|---|
+| `--chunk-size BYTES` | `8388608` (8 MiB) | Network read chunk size in bytes. |
+
+```bash
+# Download to the current directory (saves as backup.tar.gz)
+python scripts/download.py data/backup.tar.gz
+
+# Save to an explicit path
+python scripts/download.py data/backup.tar.gz /mnt/nas/backup.tar.gz
+
+# Smaller chunk size for memory-constrained devices (e.g. Raspberry Pi)
+python scripts/download.py --chunk-size 1048576 data/backup.tar.gz
+```
+
+### sync.py — Trigger an archive sync and wait for completion
+
+```
+python scripts/sync.py [--poll-interval SECONDS]
+```
+
+Logs in, calls `async_synchronize()` to queue a migration job from temp to
+archive storage, then polls until the job finishes.  Exits with code `0` on
+success or `1` on failure or interruption.
+
+| Option | Default | Description |
+|---|---|---|
+| `--poll-interval N` | `30` | Seconds between completion polls. |
+
+```bash
+# Trigger a sync with the default 30-second poll interval
+python scripts/sync.py
+
+# Poll every 2 minutes for slow archive backends
+python scripts/sync.py --poll-interval 120
+```
+
+---
+
 ## Known limitations
 
 - `temp_get()` now enforces a hard memory cap (default 10 MiB) and will refuse

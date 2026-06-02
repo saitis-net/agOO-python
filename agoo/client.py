@@ -908,10 +908,15 @@ class Agoo:
             return None
 
         for f, size in file_entries:
-            if size > 0.9 * total_cache:
+            # Compare against the safety-margin-adjusted capacity (90% of total,
+            # i.e. 1 - _CACHE_SAFETY_MARGIN) rather than the raw total, because
+            # that is the maximum space any single upload can ever use.
+            if size > total_cache * (1.0 - _CACHE_SAFETY_MARGIN):
                 self._error = (
-                    f"batch_put: '{f}' ({size:,} bytes) exceeds the total cache "
-                    f"capacity ({total_cache:,} bytes) and can never be uploaded"
+                    f"batch_put: '{f}' ({size:,} bytes) exceeds the effective cache "
+                    f"capacity ({int(total_cache * (1.0 - _CACHE_SAFETY_MARGIN)):,} bytes "
+                    f"= {total_cache:,} total × {1.0 - _CACHE_SAFETY_MARGIN:.0%}) "
+                    f"and can never be uploaded"
                 )
                 return None
 
