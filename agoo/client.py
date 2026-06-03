@@ -68,14 +68,23 @@ _CACHE_SAFETY_MARGIN = 0.10
 
 
 class _SafeSession(requests.Session):
-    """requests.Session that strips X-Auth on cross-origin redirects.
+    """requests.Session that strips X-Auth on cross-origin redirects and
+    disables cookie accumulation.
 
     requests strips the Authorization header on cross-origin redirects but
     leaves custom headers — including X-Auth — intact.  This subclass
     overrides rebuild_auth() to also drop X-Auth whenever the redirect
     target has a different host than the original request, preventing the
     session token from being forwarded to a third-party domain.
+
+    The agOO protocol authenticates exclusively via X-Auth; cookie storage
+    is disabled to prevent server-set cookies from interfering with that
+    model or being silently replayed on future requests (F-10).
     """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.cookies = requests.cookies.RequestsCookieJar()  # reject all server cookies
 
     def rebuild_auth(self, prepared_request, response) -> None:
         super().rebuild_auth(prepared_request, response)
@@ -551,13 +560,18 @@ class Agoo:
 
         return False
 
-    def logout(self):
-        """Log out from the agOO service.
+    def logout(self) -> None:
+        """Clear the local session token (F-09).
 
-        Not yet implemented in the original Perl module.
-        The session is probably invalidated automatically when the instance stops.
+        The agOO server does not expose a logout endpoint; the server-side
+        session expires automatically when the backend instance stops.
+        Calling this makes the client object inert — authenticated calls will
+        raise RuntimeError until login() is called again.
         """
-        raise NotImplementedError("logout is not yet implemented")
+        self._auth_token = None
+
+    def __del__(self) -> None:
+        self._auth_token = None
 
     # -------------------------------------------------------------------
     # Actions on temp storage (and archive metadata)
