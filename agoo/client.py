@@ -702,7 +702,7 @@ class Agoo:
     # resume from there, so this counts resume attempts, not raw retries.
     _TUS_MAX_RESUME = 5
 
-    def temp_put(self, f: str) -> bool | None:
+    def temp_put(self, f: str, override: bool = False) -> bool | None:
         """Upload a local file to temp storage using the TUS resumable protocol.
 
         The file is read and sent in chunks of io_size bytes so that large
@@ -715,9 +715,11 @@ class Agoo:
                                           Upload-Offset header the upload resumes
                                           from that byte; otherwise a new slot is
                                           created with POST.
-        2. POST  /api/tus/<path>?override=false  with Upload-Length: <total bytes>
+        2. POST  /api/tus/<path>?override=<bool>  with Upload-Length: <total bytes>
                                           Registers the upload slot on the server
                                           (only when no existing slot was found).
+                                          When override=True the server replaces
+                                          any existing copy (in temp or archive).
         3. PATCH /api/tus/<path>          Sends file data starting from the
                                           current offset.  On connection failure
                                           the server is queried again via HEAD and
@@ -726,9 +728,12 @@ class Agoo:
 
         Parameters
         ----------
-        f : local file path (must reside within the current working directory)
+        f        : local file path (must reside within the current working directory)
+        override : if True, overwrite any existing copy of the file on the server
+                   (in temp or archive).  If False (default), an existing file is
+                   skipped and True is returned without re-uploading.
 
-        Returns True on success, None on failure.
+        Returns True on success or skip, None on failure.
 
         SECURITY: _validate_local_path() is called first to reject null bytes
         and path-traversal sequences that could exfiltrate arbitrary files.
@@ -799,21 +804,53 @@ class Agoo:
 
         if offset is None:
             # No in-progress TUS slot — register a new upload.
+            # override=true tells the server to replace any existing copy of
+            # the file (in temp or archive); override=false leaves it intact
+            # and returns 409 if a copy already exists.
+            override_str = "true" if override else "false"
             response = self._post(
-                tus_path + "?override=false",
+                tus_path + f"?override={override_str}",
                 **{"Upload-Length": str(file_size)},
             )
             if response is None:
-                # 409 Conflict means the file already exists on the server
-                # (fully uploaded in a previous run; TUS slot was cleaned up
-                # on completion so HEAD found nothing).  Verify by stat-ing
-                # the file and confirming the size matches.
+                # 409 Conflict: the file already exists on the server and
+                # override=false was used.  The TUS slot was cleaned up on
+                # the previous completed upload, so the HEAD above found
+                # nothing, but the file itself is still present.
+                #
+                # Two sub-cases:
+                #   (a) File is in temp  → stat() returns its metadata; skip
+                #       if sizes match, fail if they differ (different content).
+                #   (b) File is in archive → stat() returns 404 (the temp API
+                #       does not surface archived files); treat as "already
+                #       present" and skip rather than failing with a misleading
+                #       error.
                 if self._error and "409" in self._error:
                     existing = self.stat(f)
-                    if existing and existing.get("size") == file_size:
+                    if existing is not None:
+                        # File is in temp; check the size so we don't silently
+                        # skip a file whose content has changed.
+                        if existing.get("size") == file_size:
+                            self._debug(
+                                f"temp_put: '{f}' already in temp "
+                                f"({file_size:,} bytes), skipping"
+                            )
+                            return True
+                        # Size mismatch: content has changed but the caller did
+                        # not pass override=True.  Report clearly.
+                        self._error = (
+                            f"temp_put: '{f}' already exists on server with a "
+                            f"different size ({existing.get('size'):,} B on server "
+                            f"vs {file_size:,} B locally); use override=True to replace"
+                        )
+                        return None
+                    else:
+                        # stat returned None → file is in archive (offline).
+                        # Skip silently; the caller can use override=True to
+                        # force a re-upload over the archived copy.
                         self._debug(
-                            f"temp_put: '{f}' already present on server "
-                            f"({file_size:,} bytes), skipping"
+                            f"temp_put: '{f}' already in archive, skipping "
+                            f"(use override=True to replace)"
                         )
                         return True
                 self._error = f"could not create remote file '{f}': {self._error}"
@@ -889,7 +926,8 @@ class Agoo:
 
         return True
 
-    def batch_put(self, files: list[str], poll_interval: int = 30) -> bool | None:
+    def batch_put(self, files: list[str], poll_interval: int = 30,
+                  override: bool = False) -> bool | None:
         """Upload a list of local files, automatically batching and syncing.
 
         Use this method when the combined size of all files may exceed the
@@ -928,10 +966,13 @@ class Agoo:
         files         : ordered list of local file paths to upload.
         poll_interval : seconds to wait between async_completed() polls
                         while waiting for an archive sync to finish (default 30).
+        override      : passed through to temp_put() for each file; if True,
+                        existing copies on the server are replaced rather than
+                        skipped (default False).
 
         Returns
         -------
-        True  — every file was uploaded successfully.
+        True  — every file was uploaded successfully (or skipped when override=False).
         None  — an error occurred; self.error() contains a description.
         """
 
@@ -1091,7 +1132,7 @@ class Agoo:
                 self._debug(
                     f"batch_put: [{batch_number}] uploading '{f}' ({size:,} bytes)…"
                 )
-                if not self.temp_put(f):
+                if not self.temp_put(f, override=override):
                     # temp_put() already populated self._error.
                     return None
                 self._debug(f"batch_put: [{batch_number}] '{f}' uploaded OK")

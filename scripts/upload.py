@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""upload.py — Upload one or more local files to agOO temp storage.
+"""upload.py — Upload one or more local files to agOO temp or archive storage.
 
 Overview
 --------
@@ -17,6 +17,11 @@ relies on the library's batch_put() method, which automatically:
 For a single file that fits in the available cache the process completes
 in one shot with no sync cycle.
 
+Pre-existing files
+------------------
+Files that already exist on the server (in temp or archive) are silently
+skipped by default.  Pass --force to overwrite them instead.
+
 Usage
 -----
     python scripts/upload.py [options] <file> [<file> ...]
@@ -25,11 +30,16 @@ Options
 -------
     --poll-interval N   Seconds between sync-completion polls (default: 30).
                         Only relevant when a mid-upload sync cycle is needed.
+    --force             Overwrite files that already exist on the server,
+                        whether they are currently in temp or archive storage.
 
 Examples
 --------
-    # Upload a single file
+    # Upload a single file (skipped silently if already on the server)
     python scripts/upload.py report.tar.gz
+
+    # Force-overwrite existing copies in temp or archive
+    python scripts/upload.py --force report.tar.gz
 
     # Upload multiple files; sync cycles fire automatically if needed
     python scripts/upload.py data/*.tar.gz
@@ -39,7 +49,7 @@ Examples
 
 Exit codes
 ----------
-    0   All files uploaded successfully.
+    0   All files uploaded or skipped successfully.
     1   An error occurred (reason printed to stderr).
 
 Credentials
@@ -119,6 +129,14 @@ def main() -> int:
         metavar="SECONDS",
         help="Seconds between sync-completion polls when a cache flush is needed (default: 30).",
     )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help=(
+            "Overwrite files that already exist on the server "
+            "(in temp or archive storage)."
+        ),
+    )
     args = parser.parse_args()
 
     # -----------------------------------------------------------------------
@@ -150,36 +168,51 @@ def main() -> int:
         return 1
     print("Authenticated.")
 
-    # -----------------------------------------------------------------------
-    # Show current cache usage so the operator can see the available headroom
-    # before the upload begins.
-    # -----------------------------------------------------------------------
-    usage = client.get_usage()
-    if usage:
-        print()
-        _print_usage("Cache before upload", usage)
+    try:
+        # -----------------------------------------------------------------------
+        # Show current cache usage so the operator can see the available headroom
+        # before the upload begins.
+        # -----------------------------------------------------------------------
+        usage = client.get_usage()
+        if usage:
+            print()
+            _print_usage("Cache before upload", usage)
 
-    # -----------------------------------------------------------------------
-    # Upload — batch_put() handles all the complexity:
-    #   • single file that fits  → one TUS upload, no sync
-    #   • files that exceed cache → automatic batch + sync cycles
-    # -----------------------------------------------------------------------
-    print(f"\nUploading {len(args.files)} file(s)…")
-    result = client.batch_put(args.files, poll_interval=args.poll_interval)
+        # -----------------------------------------------------------------------
+        # Upload — batch_put() handles all the complexity:
+        #   • single file that fits  → one TUS upload, no sync
+        #   • files that exceed cache → automatic batch + sync cycles
+        #
+        # override=True (--force) tells the server to replace any existing copy
+        # of each file, whether it is currently in temp or archive storage.
+        # Without --force, existing files are silently skipped (default).
+        # -----------------------------------------------------------------------
+        if args.force:
+            print(f"\nUploading {len(args.files)} file(s) (--force: overwriting existing)…")
+        else:
+            print(f"\nUploading {len(args.files)} file(s) (existing files will be skipped)…")
 
-    if result is None:
-        print(f"\nUpload failed: {client.error()}", file=sys.stderr)
-        return 1
+        result = client.batch_put(
+            args.files,
+            poll_interval=args.poll_interval,
+            override=args.force,
+        )
 
-    # -----------------------------------------------------------------------
-    # Show updated cache usage after the upload completes.
-    # -----------------------------------------------------------------------
-    print("\nAll files uploaded successfully.")
-    usage = client.get_usage()
-    if usage:
-        _print_usage("Cache after upload ", usage)
+        if result is None:
+            print(f"\nUpload failed: {client.error()}", file=sys.stderr)
+            return 1
 
-    return 0
+        # -----------------------------------------------------------------------
+        # Show updated cache usage after the upload completes.
+        # -----------------------------------------------------------------------
+        print("\nAll files uploaded successfully.")
+        usage = client.get_usage()
+        if usage:
+            _print_usage("Cache after upload ", usage)
+
+        return 0
+    finally:
+        client.logout()
 
 
 if __name__ == "__main__":
