@@ -416,16 +416,17 @@ class Agoo:
                 # The two-tuple is (connect_timeout, read_timeout) in seconds.
                 #
                 # stream=True tells requests not to download the body
-                # immediately; the caller must iterate iter_content() instead.
-                # When stream=False (the default) requests buffers the full
-                # body before returning, which is fine for small responses.
+                # Always use stream=True so that non-streaming callers can have
+                # their response body capped before it is buffered into memory.
+                # Streaming callers (stream=True) receive the raw response and
+                # must call iter_content() / response.close() themselves.
                 response = self._session.request(
                     method,
                     url,
                     data=body,              # raw bytes payload (used by POST/PATCH)
                     headers=headers,
                     timeout=_DEFAULT_TIMEOUT,
-                    stream=stream,
+                    stream=True,
                 )
             except requests.Timeout:
                 self._error = f"{path}: request timed out (attempt {attempt})"
@@ -438,6 +439,25 @@ class Agoo:
 
             if response.ok:                 # HTTP 2xx
                 self._debug(f"_do: {method} {path} SUCCESS")
+                if not stream:
+                    # Buffer the body with a hard size cap to prevent OOM from a
+                    # malicious or misconfigured server (F-05).
+                    _MAX_API_BODY = 1 * 1024 * 1024  # 1 MiB
+                    cl = response.headers.get("Content-Length")
+                    if cl and int(cl) > _MAX_API_BODY:
+                        response.close()
+                        self._error = f"{path}: response too large ({cl} bytes)"
+                        return None
+                    chunks, total = [], 0
+                    for chunk in response.iter_content(chunk_size=65536):
+                        total += len(chunk)
+                        if total > _MAX_API_BODY:
+                            response.close()
+                            self._error = f"{path}: response body exceeded {_MAX_API_BODY} bytes"
+                            return None
+                        chunks.append(chunk)
+                    response._content = b"".join(chunks)
+                    response._content_consumed = True
                 return response
 
             # Request failed -- record the error with attempt metadata.
