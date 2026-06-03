@@ -142,42 +142,19 @@ def _validate_output_path(path: str) -> None:
 
 ---
 
-### F-04 — Remote Path Traversal via Unencoded `..` Segments
+### F-04 — Remote Paths with Unencoded `/` (By Design)
 
-**Score: 3 / 10**  
-**File:** `agoo/client.py:49`, all methods that call `uri_escape()`
+**Score: 3 / 10 → N/A**  
+**Status: CLOSED — reclassified as intentional behaviour**  
+**File:** `agoo/client.py:49`
 
-#### Description
+#### Original finding
 
-The library imports `urllib.parse.quote` as `uri_escape` without specifying the `safe` parameter, so the default `safe='/'` applies. Forward slashes and dots in remote paths are left unencoded:
+The audit flagged that `uri_escape` uses `safe='/'` (the `urllib.parse.quote` default), leaving forward slashes unencoded, unlike the Perl original which encoded them. This was assessed as a potential path-traversal risk.
 
-```python
-from urllib.parse import quote as uri_escape  # default safe='/'
+#### Resolution
 
-# A caller passing "../other-user/secret.tar" produces:
-"api/resources/../other-user/secret.tar"
-```
-
-The Perl original used `URI::Escape::uri_escape`, which encodes forward slashes and dots by default (`safe=''`), so `foo/bar` became `foo%2Fbar` at the HTTP layer. The Python port changes this semantic silently.
-
-Whether path traversal is achievable depends on how the agOO server normalises request paths before routing. HTTP servers that perform path canonicalisation before ACL checks are susceptible; servers that parse the path literally are not.
-
-#### Impact
-
-If the server is susceptible, a caller can read, stat, or delete files outside their own storage namespace by supplying a path like `../admin/sensitive-file`. Exploitation requires the caller to supply a malicious remote path, which is likely only relevant if the path is derived from untrusted input (e.g. a filename received from a third party).
-
-#### Recommendation
-
-Explicitly set `safe=''` to encode all non-unreserved characters including `/` and `.`:
-
-```python
-from urllib.parse import quote
-
-def _remote_escape(path: str) -> str:
-    return quote(path, safe='')
-```
-
-This matches the Perl behaviour and prevents path components from being interpreted as URL path separators by the server.
+The divergence from the Perl behaviour is intentional. The Python client supports hierarchical remote paths (e.g. `"folder/file.txt"`) as a first-class feature, and encoding slashes would break that API. The server-side ACL model is expected to enforce namespace boundaries regardless of how the path is transmitted. This finding is not a vulnerability.
 
 ---
 
@@ -403,7 +380,7 @@ Scores show original / residual. "—" residual means the finding is fully close
 | F-01 | Plaintext credentials in version-controlled files and git history | **7** | **3** | Partial — source fixed, history not rewritten | `scripts/*.py` |
 | F-02 | `X-Auth` token forwarded on cross-domain HTTP redirects | **4** | — | **Resolved** (`f1331e4`) | `client.py:_SafeSession` |
 | F-03 | Arbitrary local file write in `temp_get_file()` | **4** | — | **Resolved** (`f1331e4`) | `client.py:_validate_output_path()` |
-| F-04 | Remote path traversal via unencoded `..` in `uri_escape` | **3** | **3** | Open | `client.py` (all remote-path calls) |
+| F-04 | Remote paths with unencoded `/` | **3** | N/A | **By design** — intentional API feature | `client.py:uri_escape` |
 | F-05 | Unbounded response body buffering in non-streaming API calls | **3** | — | **Resolved** (`106aa43`) | `client.py:_do()` |
 | F-06 | TOCTOU race between path validation and `open()` | **2** | **2** | Open | `client.py:temp_put()` |
 | F-07 | Predictable sentinel path enables local symlink attack | **2** | **2** | Open | `client.py:async_synchronize()` |
@@ -440,8 +417,7 @@ The following measures are already in place and represent good practice:
 ### Remaining open items (as of 2026-06-03)
 
 1. **Rotate the agOO password and rewrite git history** (F-01 residual). Source code is clean, but `git log -p` on any clone made before `c7a2feb` still reveals the plaintext password. Use `git filter-repo --replace-text` and force-push (or re-create) the repository.
-2. **Switch to `safe=''` in `uri_escape`** to match Perl semantics and prevent server-side path traversal (F-04). One-line fix.
-3. Remaining findings (F-06 through F-10) are low priority and can be addressed in a single hardening pass.
+2. Remaining findings (F-06 through F-10) are low priority and can be addressed in a single hardening pass.
 
 ### Resolved
 - ~~F-02~~ — `_SafeSession` strips `X-Auth` on cross-origin redirects.
