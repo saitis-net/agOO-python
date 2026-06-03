@@ -302,9 +302,9 @@ Either omit the `Referer` header entirely, or restrict it to the origin only (`R
 
 ### F-09 — No Session Revocation (`logout()` Not Implemented)
 
-**Score: 1 / 10**  
-**Status: CLOSED — accepted risk, attack scenario considered highly unlikely**  
-**File:** `agoo/client.py:489-495`
+**Score: 1 / 10 → residual: 0 / 10 (fully mitigated)**  
+**Status: RESOLVED — commit `9efcf17`**  
+**File:** `agoo/client.py:logout()`, `agoo/client.py:__del__()`
 
 #### Description
 
@@ -319,17 +319,25 @@ def logout(self):
 
 Increases the window of opportunity for token-reuse attacks. Low severity in isolation; combines badly with F-02.
 
-#### Recommendation
+#### Mitigation applied (commit `9efcf17`, 2026-06-03)
 
-Implement a `POST /api/logout` call (if the server supports it) and clear `self._auth_token = None` on completion. As a minimum, clear the in-memory token on object destruction via `__del__` so at least the client-side copy is discarded.
+The server does not expose a logout endpoint (the Perl original never implemented one). `logout()` now clears `self._auth_token = None`, making the client object inert until `login()` is called again. A `__del__` method ensures the token is also wiped when the object is garbage-collected, even if the caller never calls `logout()` explicitly:
+
+```python
+def logout(self) -> None:
+    self._auth_token = None
+
+def __del__(self) -> None:
+    self._auth_token = None
+```
 
 ---
 
 ### F-10 — `requests.Session` Silently Accumulates Server-Set Cookies
 
-**Score: 1 / 10**  
-**Status: CLOSED — accepted risk, attack scenario considered highly unlikely**  
-**File:** `agoo/client.py:167-169`
+**Score: 1 / 10 → residual: 0 / 10 (fully mitigated)**  
+**Status: RESOLVED — commit `9efcf17`**  
+**File:** `agoo/client.py:_SafeSession.__init__()`
 
 #### Description
 
@@ -349,14 +357,17 @@ If the server ever emits a `Set-Cookie` header (e.g. for a CSRF token, a session
 
 Low in practice. Could become relevant if the server adds cookie-based CSRF protection and the replayed cookies conflict with fresh CSRF tokens.
 
-#### Recommendation
+#### Mitigation applied (commit `9efcf17`, 2026-06-03)
 
-Disable cookie storage explicitly to make the authentication model unambiguous:
+`_SafeSession.__init__()` replaces the default cookie jar with an inert empty `RequestsCookieJar`, so any `Set-Cookie` headers from the server are silently discarded and nothing is replayed on subsequent requests:
 
 ```python
-self._session.cookies = requests.cookies.RequestsCookieJar()
-# or: install a null cookie policy
+def __init__(self) -> None:
+    super().__init__()
+    self.cookies = requests.cookies.RequestsCookieJar()
 ```
+
+Placing the fix in `_SafeSession` rather than `Agoo.__init__()` keeps the policy co-located with the other session security controls.
 
 ---
 
@@ -390,8 +401,8 @@ Scores show original / residual. "—" residual means the finding is fully close
 | F-06 | TOCTOU race between path validation and `open()` | **2** | N/A | **Accepted risk** | `client.py:temp_put()` |
 | F-07 | Predictable sentinel path enables local symlink attack | **2** | N/A | **Accepted risk** | `client.py:async_synchronize()` |
 | F-08 | `Referer` header leaks API username to `start_url` | **1** | N/A | **Accepted risk** | `client.py:_do()` |
-| F-09 | No session revocation (`logout()` unimplemented) | **1** | N/A | **Accepted risk** | `client.py:logout()` |
-| F-10 | `requests.Session` silently accumulates server cookies | **1** | N/A | **Accepted risk** | `client.py:__init__()` |
+| F-09 | No session revocation (`logout()` unimplemented) | **1** | — | **Resolved** (`9efcf17`) | `client.py:logout()`, `__del__()` |
+| F-10 | `requests.Session` silently accumulates server cookies | **1** | — | **Resolved** (`9efcf17`) | `client.py:_SafeSession.__init__()` |
 | F-11 | `debug=True` hard-coded in `_upload_eos.py` | **1** | — | **Resolved** (`c7a2feb`) | `scripts/_upload_eos.py` (deleted) |
 
 ---
@@ -428,5 +439,7 @@ The following measures are already in place and represent good practice:
 - ~~F-03~~ — `_validate_output_path()` guards `temp_get_file()` against path traversal writes.
 - ~~F-04~~ — Unencoded `/` in remote paths is intentional API behaviour.
 - ~~F-05~~ — `_do()` buffers non-streaming responses iteratively with a 1 MiB cap.
-- ~~F-06–F-10~~ — Accepted risk; attack scenarios considered highly unlikely in practice.
+- ~~F-06–F-08~~ — Accepted risk; attack scenarios considered highly unlikely in practice.
+- ~~F-09~~ — `logout()` clears `_auth_token`; `__del__` ensures cleanup on destruction.
+- ~~F-10~~ — `_SafeSession` now uses an inert cookie jar, discarding all server-set cookies.
 - ~~F-11~~ — `_upload_eos.py` deleted.
