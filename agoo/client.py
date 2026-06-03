@@ -250,24 +250,24 @@ class Agoo:
         Checks applied
         --------------
         - Null bytes: rejected; they terminate C strings and may confuse the OS.
-        - Path traversal: the resolved (canonical) path must sit inside the
-          current working directory so that only files the caller explicitly
-          placed there can be uploaded.
+        - Relative path traversal: a relative path must resolve within the CWD.
+          Absolute paths are permitted — the caller explicitly chose the location.
         """
         if "\x00" in path:
             raise ValueError(f"path contains a null byte: {path!r}")
 
-        cwd = Path.cwd().resolve()
-        resolved = (cwd / path).resolve()   # resolve symlinks and ".." components
+        if not os.path.isabs(path):
+            cwd = Path.cwd().resolve()
+            resolved = (cwd / path).resolve()   # resolve symlinks and ".." components
 
-        # resolved.is_relative_to(cwd) requires Python 3.9+; the equivalent
-        # comparison below works on 3.8+ as well.
-        try:
-            resolved.relative_to(cwd)
-        except ValueError:
-            raise ValueError(
-                f"path escapes the working directory: {path!r} resolves to {resolved}"
-            )
+            # resolved.is_relative_to(cwd) requires Python 3.9+; the equivalent
+            # comparison below works on 3.8+ as well.
+            try:
+                resolved.relative_to(cwd)
+            except ValueError:
+                raise ValueError(
+                    f"path escapes the working directory: {path!r} resolves to {resolved}"
+                )
 
     @staticmethod
     def _validate_output_path(path: str) -> None:
