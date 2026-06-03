@@ -561,13 +561,13 @@ class Agoo:
         return False
 
     def logout(self) -> None:
-        """Clear the local session token (F-09).
+        """Terminate the backend instance and clear the local session token.
 
-        The agOO server does not expose a logout endpoint; the server-side
-        session expires automatically when the backend instance stops.
-        Calling this makes the client object inert — authenticated calls will
-        raise RuntimeError until login() is called again.
+        Calls terminate() to shut down the agOO backend, then discards the
+        local auth token so the client object becomes inert. Authenticated
+        calls will raise RuntimeError until login() is called again.
         """
+        self.terminate()
         self._auth_token = None
 
     def __del__(self) -> None:
