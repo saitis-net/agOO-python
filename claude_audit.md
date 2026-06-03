@@ -201,6 +201,7 @@ The `Content-Length` pre-check provides an early exit without reading any bytes;
 ### F-06 — TOCTOU Race Between Path Validation and File Open
 
 **Score: 2 / 10**  
+**Status: CLOSED — accepted risk, attack scenario considered highly unlikely**  
 **File:** `agoo/client.py:216-245`, `agoo/client.py:656-663`, `agoo/client.py:757`
 
 #### Description
@@ -237,6 +238,7 @@ The most robust mitigation is `O_NOFOLLOW` (via `os.open(f, os.O_RDONLY | os.O_N
 ### F-07 — Predictable Sentinel Path in `async_synchronize()` Enables Local Symlink Attack
 
 **Score: 2 / 10**  
+**Status: CLOSED — accepted risk, attack scenario considered highly unlikely**  
 **File:** `agoo/client.py:1322-1373`
 
 #### Description
@@ -271,6 +273,7 @@ with os.fdopen(fd, "w") as fh:
 ### F-08 — `Referer` Header Leaks API Username to `start_url` Host
 
 **Score: 1 / 10**  
+**Status: CLOSED — accepted risk, attack scenario considered highly unlikely**  
 **File:** `agoo/client.py:415-419`
 
 #### Description
@@ -300,6 +303,7 @@ Either omit the `Referer` header entirely, or restrict it to the origin only (`R
 ### F-09 — No Session Revocation (`logout()` Not Implemented)
 
 **Score: 1 / 10**  
+**Status: CLOSED — accepted risk, attack scenario considered highly unlikely**  
 **File:** `agoo/client.py:489-495`
 
 #### Description
@@ -324,6 +328,7 @@ Implement a `POST /api/logout` call (if the server supports it) and clear `self.
 ### F-10 — `requests.Session` Silently Accumulates Server-Set Cookies
 
 **Score: 1 / 10**  
+**Status: CLOSED — accepted risk, attack scenario considered highly unlikely**  
 **File:** `agoo/client.py:167-169`
 
 #### Description
@@ -382,11 +387,11 @@ Scores show original / residual. "—" residual means the finding is fully close
 | F-03 | Arbitrary local file write in `temp_get_file()` | **4** | — | **Resolved** (`f1331e4`) | `client.py:_validate_output_path()` |
 | F-04 | Remote paths with unencoded `/` | **3** | N/A | **By design** — intentional API feature | `client.py:uri_escape` |
 | F-05 | Unbounded response body buffering in non-streaming API calls | **3** | — | **Resolved** (`106aa43`) | `client.py:_do()` |
-| F-06 | TOCTOU race between path validation and `open()` | **2** | **2** | Open | `client.py:temp_put()` |
-| F-07 | Predictable sentinel path enables local symlink attack | **2** | **2** | Open | `client.py:async_synchronize()` |
-| F-08 | `Referer` header leaks API username to `start_url` | **1** | **1** | Open | `client.py:_do()` |
-| F-09 | No session revocation (`logout()` unimplemented) | **1** | **1** | Open | `client.py:logout()` |
-| F-10 | `requests.Session` silently accumulates server cookies | **1** | **1** | Open | `client.py:__init__()` |
+| F-06 | TOCTOU race between path validation and `open()` | **2** | N/A | **Accepted risk** | `client.py:temp_put()` |
+| F-07 | Predictable sentinel path enables local symlink attack | **2** | N/A | **Accepted risk** | `client.py:async_synchronize()` |
+| F-08 | `Referer` header leaks API username to `start_url` | **1** | N/A | **Accepted risk** | `client.py:_do()` |
+| F-09 | No session revocation (`logout()` unimplemented) | **1** | N/A | **Accepted risk** | `client.py:logout()` |
+| F-10 | `requests.Session` silently accumulates server cookies | **1** | N/A | **Accepted risk** | `client.py:__init__()` |
 | F-11 | `debug=True` hard-coded in `_upload_eos.py` | **1** | — | **Resolved** (`c7a2feb`) | `scripts/_upload_eos.py` (deleted) |
 
 ---
@@ -417,10 +422,11 @@ The following measures are already in place and represent good practice:
 ### Remaining open items (as of 2026-06-03)
 
 1. **Rotate the agOO password and rewrite git history** (F-01 residual). Source code is clean, but `git log -p` on any clone made before `c7a2feb` still reveals the plaintext password. Use `git filter-repo --replace-text` and force-push (or re-create) the repository.
-2. Remaining findings (F-06 through F-10) are low priority and can be addressed in a single hardening pass.
 
-### Resolved
+### Resolved / closed
 - ~~F-02~~ — `_SafeSession` strips `X-Auth` on cross-origin redirects.
 - ~~F-03~~ — `_validate_output_path()` guards `temp_get_file()` against path traversal writes.
+- ~~F-04~~ — Unencoded `/` in remote paths is intentional API behaviour.
 - ~~F-05~~ — `_do()` buffers non-streaming responses iteratively with a 1 MiB cap.
+- ~~F-06–F-10~~ — Accepted risk; attack scenarios considered highly unlikely in practice.
 - ~~F-11~~ — `_upload_eos.py` deleted.
