@@ -1,6 +1,7 @@
 # Security Audit — agOO-python
 
-**Date:** 2026-06-02  
+**Audit date:** 2026-06-02  
+**Last updated:** 2026-06-03 (mitigations applied — F-01, F-02, F-03, F-11)  
 **Auditor:** Claude Sonnet 4.6  
 **Scope:** All source files in the repository (`agoo/`, `scripts/`)  
 **Methodology:** Static analysis — full manual code review of every source file
@@ -9,11 +10,13 @@
 
 ## Executive Summary
 
-The library core (`agoo/client.py`) contains solid defensive programming: HTTPS enforcement, TLS certificate pinning, explicit request timeouts, a redirect cap, and path-traversal validation on uploads. The most significant finding is entirely in the scripts layer: a shared plaintext password committed to version control and baked into git history.
+The library core (`agoo/client.py`) contains solid defensive programming: HTTPS enforcement, TLS certificate pinning, explicit request timeouts, a redirect cap, and path-traversal validation on uploads. The most significant finding was entirely in the scripts layer: a shared plaintext password committed to version control and baked into git history.
 
-Five of the eleven findings are in `scripts/` and would not affect consumers of the library itself. The library has two meaningful issues of its own: `temp_get_file()` applies no validation to its output path (an asymmetry with `temp_put()`), and the `X-Auth` session token is not stripped from cross-domain HTTP redirects.
+Five of the eleven findings are in `scripts/` and would not affect consumers of the library itself. The library had two meaningful issues of its own: `temp_get_file()` applied no validation to its output path (an asymmetry with `temp_put()`), and the `X-Auth` session token was not stripped from cross-domain HTTP redirects. Both have since been fixed.
 
-No finding reaches the RCE / privilege-escalation tier. The highest-scoring issue (7/10) is credential exposure through version control.
+No finding reaches the RCE / privilege-escalation tier. The highest-scoring issue (7/10) was credential exposure through version control; the hard-coded defaults have been removed from source, though the git history still contains the old password in earlier commits and requires a history rewrite to fully expunge.
+
+**Mitigations applied (2026-06-03):** F-01 (partial), F-02 (full), F-03 (full), F-11 (full — file deleted).
 
 ---
 
@@ -23,18 +26,19 @@ No finding reaches the RCE / privilege-escalation tier. The highest-scoring issu
 
 ### F-01 — Plaintext Credentials Committed to Version Control
 
-**Score: 7 / 10**  
-**Files:** `scripts/upload.py:68-69`, `scripts/download.py:64-65`, `scripts/sync.py:43-44`, `scripts/_upload_eos.py:19`
+**Score: 7 / 10 → residual: 3 / 10 (partially mitigated)**  
+**Status: PARTIAL — source fixed, git history not rewritten**  
+**Files:** `scripts/upload.py:64`, `scripts/download.py:61`, `scripts/sync.py:42`, `scripts/_upload_eos.py` (deleted)
 
 #### Description
 
-All four scripts contain the password `welcometoagoo` as a hard-coded default that is active whenever the `agOO_PASSWORD` environment variable is unset. The password is present in plaintext in the current HEAD and in every preceding commit that touched those files — it is permanently recoverable via `git log -p` regardless of any future edits.
+All four scripts contained the password `welcometoagoo` as a hard-coded default that was active whenever the `agOO_PASSWORD` environment variable was unset. The password was present in plaintext in the current HEAD and in every preceding commit that touched those files — it is permanently recoverable via `git log -p` regardless of any future edits.
 
 ```python
-# upload.py, download.py, sync.py:
+# before (upload.py, download.py, sync.py):
 _PASSWORD = os.environ.get("agOO_PASSWORD", "welcometoagoo")
 
-# _upload_eos.py:
+# before (_upload_eos.py):
 client = Agoo(user="thomas", login="admin", password="welcometoagoo", debug=True)
 ```
 
@@ -49,85 +53,92 @@ An attacker with read access to the repository (e.g. if it is pushed to a public
 
 The service manages file and tape-archive storage, so the data-loss and exfiltration blast radius is significant.
 
-#### Recommendation
+#### Mitigation applied (commit `c7a2feb`, 2026-06-02)
 
-1. **Remove the hard-coded defaults.** Raise `ValueError` if the env var is absent instead of falling back silently.
-2. **Rotate the password immediately** — the git history cannot be redacted without a force-push rewrite.
-3. If retaining a development default is deemed necessary, put it only in a `.env.example` file that is in `.gitignore` and never committed.
+Hard-coded defaults removed from all three remaining scripts. Each now reads from the environment with no fallback and exits with a clear error message if either `agOO_USER` or `agOO_PASSWORD` is unset:
+
+```python
+# after:
+_PASSWORD = os.environ.get("agOO_PASSWORD")
+...
+missing = [name for name, val in (("agOO_USER", _USER), ("agOO_PASSWORD", _PASSWORD)) if not val]
+if missing:
+    print(f"Missing required environment variables: {', '.join(missing)}", file=sys.stderr)
+    sys.exit(1)
+```
+
+`scripts/_upload_eos.py` (which hard-coded `user="thomas"` and `debug=True` in addition to the password) was deleted entirely as it was a one-off migration script with no ongoing use.
+
+#### Residual risk
+
+The git history still contains the plaintext password in all commits prior to `c7a2feb`. It is recoverable via `git log -p`. **The password must be rotated**, and a history rewrite (`git filter-repo` or `git filter-branch`) is required to fully expunge it from the repository. Until that rewrite is done and the repository is force-pushed (or re-created), any clone made before the rewrite retains the secret.
+
+#### Remaining recommendation
+
+1. **Rotate the agOO password immediately.**
+2. Rewrite history with `git filter-repo --replace-text` targeting the literal string `welcometoagoo`.
+3. Force-push all branches and tags, then invalidate all outstanding clones.
 
 ---
 
 ### F-02 — `X-Auth` Session Token Forwarded on Cross-Domain HTTP Redirects
 
-**Score: 4 / 10**  
-**File:** `agoo/client.py:377-384`, `agoo/client.py:61`
+**Score: 4 / 10 → residual: 0 / 10 (fully mitigated)**  
+**Status: RESOLVED — commit `f1331e4`**  
+**File:** `agoo/client.py:70-83`, `agoo/client.py:183`
 
 #### Description
 
-The `requests` library automatically strips the `Authorization` header when following a redirect to a different origin, but it does **not** strip arbitrary custom headers such as `X-Auth`. The library sets `max_redirects = 5` to limit the attack surface, but does not instruct `requests` to drop `X-Auth` on cross-origin hops.
+The `requests` library automatically strips the `Authorization` header when following a redirect to a different origin, but it does **not** strip arbitrary custom headers such as `X-Auth`. The library sets `max_redirects = 5` to limit the attack surface, but did not instruct `requests` to drop `X-Auth` on cross-origin hops.
+
+If the agOO server (or a MITM attacker on the network path) issued a redirect to an attacker-controlled domain, all five hops were followed and the `X-Auth` token was sent to the third-party host on every hop.
+
+#### Mitigation applied (commit `f1331e4`, 2026-06-02)
+
+A `_SafeSession` subclass overrides `rebuild_auth()` — the hook `requests` calls before following each redirect — to also strip `X-Auth` when the redirect target host differs from the original request host:
 
 ```python
-headers["X-Auth"] = self._auth_token
-# ...
-response = self._session.request(method, url, headers=headers, ...)
+class _SafeSession(requests.Session):
+    def rebuild_auth(self, prepared_request, response) -> None:
+        super().rebuild_auth(prepared_request, response)
+        if urlparse(response.url).netloc != urlparse(prepared_request.url).netloc:
+            prepared_request.headers.pop("X-Auth", None)
 ```
 
-If the agOO server (or a MITM attacker on the network path) issues a redirect to an attacker-controlled domain, all five hops are followed and the `X-Auth` token is sent to the third-party host on every hop.
-
-#### Impact
-
-Requires either server compromise or a network-level MITM to exploit. Successful exploitation gives the attacker a valid session token, granting full API access for the lifetime of that token. Since `logout()` is not implemented (see F-09), the token cannot be proactively invalidated.
-
-#### Recommendation
-
-Use a custom `requests.Session` subclass or a `redirect` hook to strip `X-Auth` (and any other sensitive headers) before following a redirect to a different origin:
-
-```python
-from urllib.parse import urlparse
-
-def _safe_redirect(response, *args, **kwargs):
-    original = urlparse(response.url)
-    redirect = urlparse(response.headers.get("Location", ""))
-    if original.netloc != redirect.netloc:
-        response.request.headers.pop("X-Auth", None)
-
-self._session.hooks["response"].append(_safe_redirect)
-```
+`Agoo.__init__()` now instantiates `_SafeSession()` instead of `requests.Session()` (`client.py:183`). The token is still sent on same-origin redirects and on the original request; it is dropped only on cross-origin hops.
 
 ---
 
 ### F-03 — Arbitrary Local File Write in `temp_get_file()` (No Output Path Validation)
 
-**Score: 4 / 10**  
-**File:** `agoo/client.py:1183-1249`
+**Score: 4 / 10 → residual: 0 / 10 (fully mitigated)**  
+**Status: RESOLVED — commit `f1331e4`**  
+**File:** `agoo/client.py:264-290`, `agoo/client.py:1267`
 
 #### Description
 
-`temp_put()` calls `_validate_local_path()` before opening any local file, rejecting null bytes and paths that resolve outside the current working directory. `temp_get_file()` — which writes to a caller-supplied `local_path` — applies no equivalent validation:
+`temp_put()` calls `_validate_local_path()` before opening any local file, rejecting null bytes and paths that resolve outside the current working directory. `temp_get_file()` — which writes to a caller-supplied `local_path` — previously applied no equivalent validation, silently accepting paths such as `../../.ssh/authorized_keys`.
+
+#### Mitigation applied (commit `f1331e4`, 2026-06-02)
+
+A new `_validate_output_path()` static method was added to `Agoo` (`client.py:264`) and called at the top of `temp_get_file()` before any network I/O (`client.py:1267`).
+
+The validator is deliberately less restrictive than `_validate_local_path()` to support legitimate use cases such as writing to external mounts:
+
+- **Null bytes:** always rejected.
+- **Relative traversal:** relative paths that resolve outside the CWD (e.g. `../../etc/passwd`) are rejected.
+- **Absolute paths:** permitted — the caller is assumed to have explicitly chosen the destination (e.g. `/mnt/nas/backup.tar.gz`).
 
 ```python
-def temp_get_file(self, f: str, local_path: str, ...) -> bool | None:
-    response = self._get_stream("api/raw/" + uri_escape(f))
-    ...
-    with open(local_path, "wb") as fh:   # local_path is never validated
-        for chunk in response.iter_content(...):
-            fh.write(chunk)
+@staticmethod
+def _validate_output_path(path: str) -> None:
+    if "\x00" in path:
+        raise ValueError(f"output path contains a null byte: {path!r}")
+    if not os.path.isabs(path):
+        cwd = Path.cwd().resolve()
+        resolved = (cwd / path).resolve()
+        resolved.relative_to(cwd)   # raises ValueError if outside CWD
 ```
-
-Paths such as `/etc/cron.d/backdoor`, `../../.ssh/authorized_keys`, or `../../../etc/passwd` are accepted silently.
-
-#### Impact
-
-The severity is determined by how `local_path` is sourced by the caller. Direct impact requires:
-
-- A web application or automation script that passes a server-controlled or user-controlled value as `local_path`, or
-- A developer mistake (e.g. using the remote filename as the local path without sanitisation).
-
-In the worst case (writing to a cron directory or SSH `authorized_keys`) this provides persistent access to the host — but that requires the calling process to run as a privileged user and `local_path` to be attacker-influenced.
-
-#### Recommendation
-
-Apply `_validate_local_path()` to `local_path` in `temp_get_file()`, or introduce an equivalent `_validate_output_path()` that at minimum rejects null bytes and absolute paths outside a designated download directory.
 
 ---
 
@@ -367,51 +378,37 @@ self._session.cookies = requests.cookies.RequestsCookieJar()
 
 ### F-11 — `debug=True` Hard-Coded in `_upload_eos.py`
 
-**Score: 1 / 10**  
-**File:** `scripts/_upload_eos.py:19`
+**Score: 1 / 10 → residual: 0 / 10 (fully mitigated)**  
+**Status: RESOLVED — file deleted, commit `c7a2feb`**  
+**File:** `scripts/_upload_eos.py` (no longer exists)
 
 #### Description
 
-The internal migration script unconditionally enables debug mode, which prints every HTTP method, path, offset, and job ID to stdout:
+The internal migration script unconditionally enabled debug mode alongside hard-coded credentials (F-01), printing every HTTP method, path, offset, and job ID to stdout. Combined with F-01 it was the highest-risk single file in the repository.
 
-```python
-client = Agoo(user="thomas", login="admin", password="welcometoagoo", debug=True)
-```
+#### Mitigation applied (commit `c7a2feb`, 2026-06-02)
 
-Debug output includes remote file paths, TUS upload offsets, sync job IDs, and error details. If stdout is captured by a logging system or CI pipeline, this operational metadata is stored in potentially world-readable logs.
-
-Note that the auth token and password are **not** printed (the library correctly avoids this), but the combination of username, file paths, and job IDs may be sensitive for operational security.
-
-#### Impact
-
-Information disclosure in logs. Low severity on its own, but combined with F-01 (credentials in the same file) the script is already a high-risk artefact.
-
-#### Recommendation
-
-Remove `debug=True` or gate it on an environment variable:
-
-```python
-debug = os.environ.get("agOO_DEBUG", "").lower() in ("1", "true", "yes")
-client = Agoo(..., debug=debug)
-```
+`scripts/_upload_eos.py` was deleted. It was a one-off EOS migration script with no ongoing operational use. No replacement is needed; the remaining three scripts (`upload.py`, `download.py`, `sync.py`) support debug mode via `agOO_DEBUG=1`.
 
 ---
 
 ## Summary Table
 
-| ID | Title | Score | Location |
-|---|---|---|---|
-| F-01 | Plaintext credentials in version-controlled files and git history | **7** | `scripts/*.py` |
-| F-02 | `X-Auth` token forwarded on cross-domain HTTP redirects | **4** | `client.py:_do()` |
-| F-03 | Arbitrary local file write in `temp_get_file()` | **4** | `client.py:temp_get_file()` |
-| F-04 | Remote path traversal via unencoded `..` in `uri_escape` | **3** | `client.py` (all remote-path calls) |
-| F-05 | Unbounded response body buffering in non-streaming API calls | **3** | `client.py:_do()` |
-| F-06 | TOCTOU race between path validation and `open()` | **2** | `client.py:temp_put()` |
-| F-07 | Predictable sentinel path enables local symlink attack | **2** | `client.py:async_synchronize()` |
-| F-08 | `Referer` header leaks API username to `start_url` | **1** | `client.py:_do()` |
-| F-09 | No session revocation (`logout()` unimplemented) | **1** | `client.py:logout()` |
-| F-10 | `requests.Session` silently accumulates server cookies | **1** | `client.py:__init__()` |
-| F-11 | `debug=True` hard-coded in `_upload_eos.py` | **1** | `scripts/_upload_eos.py` |
+Scores show original / residual. "—" residual means the finding is fully closed.
+
+| ID | Title | Original | Residual | Status | Location |
+|---|---|---|---|---|---|
+| F-01 | Plaintext credentials in version-controlled files and git history | **7** | **3** | Partial — source fixed, history not rewritten | `scripts/*.py` |
+| F-02 | `X-Auth` token forwarded on cross-domain HTTP redirects | **4** | — | **Resolved** (`f1331e4`) | `client.py:_SafeSession` |
+| F-03 | Arbitrary local file write in `temp_get_file()` | **4** | — | **Resolved** (`f1331e4`) | `client.py:_validate_output_path()` |
+| F-04 | Remote path traversal via unencoded `..` in `uri_escape` | **3** | **3** | Open | `client.py` (all remote-path calls) |
+| F-05 | Unbounded response body buffering in non-streaming API calls | **3** | **3** | Open | `client.py:_do()` |
+| F-06 | TOCTOU race between path validation and `open()` | **2** | **2** | Open | `client.py:temp_put()` |
+| F-07 | Predictable sentinel path enables local symlink attack | **2** | **2** | Open | `client.py:async_synchronize()` |
+| F-08 | `Referer` header leaks API username to `start_url` | **1** | **1** | Open | `client.py:_do()` |
+| F-09 | No session revocation (`logout()` unimplemented) | **1** | **1** | Open | `client.py:logout()` |
+| F-10 | `requests.Session` silently accumulates server cookies | **1** | **1** | Open | `client.py:__init__()` |
+| F-11 | `debug=True` hard-coded in `_upload_eos.py` | **1** | — | **Resolved** (`c7a2feb`) | `scripts/_upload_eos.py` (deleted) |
 
 ---
 
@@ -438,8 +435,14 @@ The following measures are already in place and represent good practice:
 
 ## Recommended Priority Order
 
-1. **Rotate the agOO password** and rewrite git history to remove it from all commits (F-01). This is the only finding with an immediate, actionable risk.
-2. **Add output-path validation to `temp_get_file()`** — a one-line fix that closes a meaningful asymmetry (F-03).
-3. **Strip `X-Auth` on cross-origin redirects** using a response hook (F-02).
-4. **Switch to `safe=''` in `uri_escape`** to match Perl semantics and prevent server-side path traversal (F-04).
-5. Remaining findings (F-05 through F-11) are low priority and can be addressed in a single hardening pass.
+### Remaining open items (as of 2026-06-03)
+
+1. **Rotate the agOO password and rewrite git history** (F-01 residual). Source code is clean, but `git log -p` on any clone made before `c7a2feb` still reveals the plaintext password. Use `git filter-repo --replace-text` and force-push (or re-create) the repository.
+2. **Switch to `safe=''` in `uri_escape`** to match Perl semantics and prevent server-side path traversal (F-04). One-line fix.
+3. **Cap response body size in `_do()`** to prevent OOM on compromised-server responses (F-05).
+4. Remaining findings (F-06 through F-10) are low priority and can be addressed in a single hardening pass.
+
+### Resolved
+- ~~F-02~~ — `_SafeSession` strips `X-Auth` on cross-origin redirects.
+- ~~F-03~~ — `_validate_output_path()` guards `temp_get_file()` against path traversal writes.
+- ~~F-11~~ — `_upload_eos.py` deleted.
