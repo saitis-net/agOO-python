@@ -57,13 +57,10 @@ pip install /path/to/agOO-python
 ```python
 from agoo import Agoo
 
-# Credentials can be passed as keyword arguments …
-client = Agoo(user="myuser", password="s3cr3t")
-
-# … or supplied via environment variables (recommended for scripts):
+# Credentials are read from environment variables (recommended):
 #   export agOO_USER=myuser
 #   export agOO_PASSWORD=s3cr3t
-client = Agoo()
+client = Agoo(user="myuser", login="admin", password="s3cr3t")
 
 # Authenticate — must be called before any other operation.
 if not client.login():
@@ -73,9 +70,12 @@ if not client.login():
 if not client.temp_put("data/report.tar.gz"):
     raise SystemExit(f"Upload failed: {client.error()}")
 
-# Get metadata for a remote file.
+# Get metadata for a remote file (returns None if the file is in archive).
 info = client.stat("data/report.tar.gz")
 print(info)
+
+# Stream a file from temp storage to disk (memory usage bounded by chunk_size).
+ok = client.temp_get_file("data/report.tar.gz", "/mnt/nas/report.tar.gz")
 
 # Trigger an async archive sync and poll for completion.
 job_id = client.async_synchronize()
@@ -86,23 +86,22 @@ while True:
         break
     time.sleep(30)
 
-# Shut down the remote instance when done.
-client.terminate()
+# Shut down the remote instance and clear the local session token.
+client.logout()
 ```
 
 ---
 
 ## Configuration
 
-All options are passed as keyword arguments to the constructor.  Any option not
-provided falls back to its default value or environment variable.
+All options are passed as keyword arguments to the constructor.
 
 | Option | Default | Env var | Description |
 |---|---|---|---|
 | `base_url` | `https://agoo.saitis.net` | — | Root URL of the agOO installation |
 | `start_url` | `https://agoo.saitis.net/cgi-bin/start-fb.cgi` | — | URL that wakes a stopped instance |
-| `login` | `admin` | — | agOO username sent in the login form |
-| `user` | *(required)* | `agOO_USER` | Per-user API namespace |
+| `login` | `admin` | — | agOO credential username sent in the login form |
+| `user` | *(required)* | `agOO_USER` | Per-user API namespace embedded in every URL path |
 | `password` | *(required)* | `agOO_PASSWORD` | Password for `login` |
 | `debug` | `False` | — | Print diagnostic output to stdout |
 | `io_size` | `10485760` (10 MiB) | — | Upload chunk size in bytes |
@@ -119,18 +118,18 @@ provided falls back to its default value or environment variable.
 | Method | Description |
 |---|---|
 | `login() → bool` | Authenticate and store the session token.  Returns `True` on success. |
-| `logout()` | *Not yet implemented.* |
+| `logout()` | Terminate the backend instance and clear the local session token. |
 
 ### Temp storage
 
 | Method | Description |
 |---|---|
 | `get_usage() → dict \| None` | Fetch cache and archive usage statistics. |
-| `stat(path) → dict \| None` | Retrieve file metadata as a dict. |
-| `temp_put(path) → bool \| None` | Upload a single local file using TUS resumable upload; checks available space first. |
-| `batch_put(files, poll_interval=30) → bool \| None` | Upload a list of files, automatically splitting into batches and running sync cycles when the combined size exceeds available cache space. |
+| `stat(path) → dict \| None` | Retrieve file metadata. Returns `None` for archived (offline) files. |
+| `temp_put(path, override=False) → bool \| None` | Upload a single local file using TUS resumable upload. Existing files are skipped unless `override=True`. |
+| `batch_put(files, poll_interval=30, override=False) → bool \| None` | Upload a list of files, automatically batching and syncing when the combined size exceeds cache space. |
 | `temp_put_fake(path)` | Create an empty placeholder file on the server. |
-| `temp_get(path, max_bytes=10MiB) → str \| None` | Download a **small** file into memory (hard cap enforced). Use for status blobs and metadata only. |
+| `temp_get(path, max_bytes=10MiB) → str \| None` | Download a small file into memory (hard cap enforced). Use for metadata blobs only. |
 | `temp_get_file(path, local_path, chunk_size=8MiB) → bool \| None` | Stream a file of any size directly to disk with bounded memory use. |
 | `temp_del(path)` | Delete a file from temp storage. |
 | `temp_sum(path, hash_type) → str \| None` | Retrieve a checksum for a remote file. |
@@ -139,8 +138,8 @@ provided falls back to its default value or environment variable.
 
 | Method | Description |
 |---|---|
-| `schedule_migrate() → bool` | No-op; migration is implicit. |
-| `schedule_unmigrate(path)` | Request a copy of an archive file back to temp. |
+| `schedule_migrate() → bool` | No-op; migration is handled implicitly by the server. |
+| `schedule_unmigrate(path)` | Request a copy of an archive file back to temp storage. |
 
 ### Async sync
 
@@ -174,26 +173,19 @@ Methods that cannot recover gracefully raise standard Python exceptions:
 |---|---|
 | `ValueError` | Bad constructor arguments (missing credentials, non-HTTPS URL, unsafe path) |
 | `RuntimeError` | Calling `stat()` before `login()` |
-| `NotImplementedError` | Calling unimplemented methods (`logout`, `system_stats`, …) |
+| `NotImplementedError` | Calling unimplemented methods (`system_stats`, `schedule_archive_check_sums`, …) |
 
 ---
 
-## Security notes
+## Pre-existing files
 
-The following hardening measures are applied by this library.
-See `changes.log` for full details of the audit findings and mitigations.
+`temp_put()` and `batch_put()` handle files that already exist on the server:
 
-- **HTTPS enforced** — `http://` URLs are rejected at construction time.
-- **TLS verification** — Certificate validation is enabled explicitly and
-  cannot be overridden by environment variables.
-- **Request timeouts** — All HTTP requests have a 10 s connect / 60 s read
-  timeout to prevent indefinite hangs.
-- **Path traversal prevention** — `temp_put()` validates that the local file
-  path stays within the current working directory.
-- **Redirect cap** — HTTP redirects are limited to 5 per request to prevent
-  loops and token leakage to third-party domains.
-- **No subprocess** — Date strings are generated with `datetime` instead of
-  spawning a shell process.
+| File location | `override=False` (default) | `override=True` |
+|---|---|---|
+| In **temp**, same size | Silently skipped | Replaced |
+| In **temp**, different size | Error — size mismatch reported | Replaced |
+| In **archive** | Silently skipped | Replaced |
 
 ---
 
@@ -217,72 +209,101 @@ if result is None:
 5. If files remain, calls `async_synchronize()` and polls until the archive
    sync finishes (freeing the cache space), then repeats from step 3.
 
-The `upload.py` script accepts multiple files and uses `batch_put()` automatically:
+---
 
-```bash
-python scripts/upload.py --poll-interval 60 data/*.tar.gz
-```
+## Security notes
+
+The following hardening measures are built into the library.
+See `claude_audit.md` for the full security audit and findings.
+
+- **HTTPS enforced** — `http://` URLs are rejected at construction time.
+- **TLS verification** — Certificate validation is enabled explicitly and
+  cannot be overridden by environment variables.
+- **Request timeouts** — All HTTP requests carry a 10 s connect / 60 s read
+  timeout to prevent indefinite hangs.
+- **Response body cap** — Non-streaming API responses are buffered with a
+  hard 1 MiB limit to prevent memory exhaustion from a malicious server.
+- **Path traversal prevention** — `temp_put()` and `temp_get_file()` both
+  validate local paths; relative traversal sequences are rejected.
+- **Redirect token protection** — The `X-Auth` session token is stripped
+  from requests before following a redirect to a different origin.
+- **Cookie isolation** — The session rejects all server-set cookies;
+  authentication is exclusively via `X-Auth`.
+- **Redirect cap** — HTTP redirects are limited to 5 per request.
+- **No subprocess** — Date strings are generated with `datetime`, not a shell.
+- **Session cleanup** — `logout()` terminates the backend and clears the
+  in-memory token; `__del__` also clears it on object destruction.
 
 ---
 
 ## Scripts
 
-The `scripts/` directory contains ready-to-run command-line tools built on top of the library.
-Credentials are read from `agOO_USER` / `agOO_PASSWORD` environment variables in all scripts.
+The `scripts/` directory contains ready-to-run command-line tools built on the library.
+All scripts read credentials from the `agOO_USER` and `agOO_PASSWORD` environment
+variables and call `logout()` on exit.
 
-### upload.py — Upload files to temp storage
+### upload.py — Upload files to temp or archive storage
 
 ```
-python scripts/upload.py [--poll-interval SECONDS] <file> [<file> ...]
+python scripts/upload.py [--poll-interval SECONDS] [--force] <file> [<file> ...]
 ```
 
-Uploads one or more local files using `batch_put()`.  When the combined size
-of all files exceeds the available cache space the script automatically batches
-the uploads and waits for an archive sync between batches.
+Uploads one or more local files using `batch_put()`.  Files that already exist
+on the server are silently skipped unless `--force` is passed.
 
 | Option | Default | Description |
 |---|---|---|
 | `--poll-interval N` | `30` | Seconds between sync-completion polls. |
+| `--force` | off | Overwrite files that already exist on the server (temp or archive). |
 
 ```bash
-# Upload a single file
+# Upload a single file (skipped if already present)
 python scripts/upload.py report.tar.gz
+
+# Force-overwrite an existing copy
+python scripts/upload.py --force report.tar.gz
 
 # Upload a directory glob; sync cycles fire automatically if needed
 python scripts/upload.py data/*.tar.gz
-
-# Override the poll interval for slow archive backends
-python scripts/upload.py --poll-interval 60 backup.tar
 ```
 
 ### download.py — Download a file from temp storage
 
 ```
-python scripts/download.py [--chunk-size BYTES] <remote-path> [<local-output-path>]
+python scripts/download.py [options] <remote-path> [<local-output-path>]
 ```
 
 Streams a file from agOO temp storage to disk one chunk at a time.  Peak
 memory usage is bounded by `--chunk-size` regardless of file size.  The script
 refuses to overwrite an existing local file.
 
+For files that have been migrated to archive, pass `--wait` to trigger an
+automatic recall and wait for the file to come back online.
+
 | Argument | Description |
 |---|---|
-| `remote-path` | Path to the file in agOO temp storage. |
-| `local-output-path` | Where to save the file locally (default: basename of remote path in the current directory). |
+| `remote-path` | Path to the file in agOO storage. |
+| `local-output-path` | Where to save the file locally (default: basename of remote path). |
 
 | Option | Default | Description |
 |---|---|---|
 | `--chunk-size BYTES` | `8388608` (8 MiB) | Network read chunk size in bytes. |
+| `--wait` | off | Trigger an archive recall and wait for the file to come online. |
+| `--poll-interval N` | `30` | Seconds between recall-completion polls (requires `--wait`). |
+| `--timeout N` | `3600` | Max seconds to wait for a recall before giving up (requires `--wait`). |
 
 ```bash
-# Download to the current directory (saves as backup.tar.gz)
+# Download to the current directory
 python scripts/download.py data/backup.tar.gz
 
 # Save to an explicit path
 python scripts/download.py data/backup.tar.gz /mnt/nas/backup.tar.gz
 
-# Smaller chunk size for memory-constrained devices (e.g. Raspberry Pi)
-python scripts/download.py --chunk-size 1048576 data/backup.tar.gz
+# Recall from archive and wait up to one hour (the default timeout)
+python scripts/download.py --wait eos/EOS-4.31.1F.swi
+
+# Recall from archive, poll every 5 minutes, give up after 2 hours
+python scripts/download.py --wait --poll-interval 300 --timeout 7200 eos/EOS-4.31.1F.swi
 ```
 
 ### sync.py — Trigger an archive sync and wait for completion
@@ -292,18 +313,14 @@ python scripts/sync.py [--poll-interval SECONDS]
 ```
 
 Logs in, calls `async_synchronize()` to queue a migration job from temp to
-archive storage, then polls until the job finishes.  Exits with code `0` on
-success or `1` on failure or interruption.
+archive storage, then polls until the job finishes.
 
 | Option | Default | Description |
 |---|---|---|
 | `--poll-interval N` | `30` | Seconds between completion polls. |
 
 ```bash
-# Trigger a sync with the default 30-second poll interval
 python scripts/sync.py
-
-# Poll every 2 minutes for slow archive backends
 python scripts/sync.py --poll-interval 120
 ```
 
@@ -311,12 +328,12 @@ python scripts/sync.py --poll-interval 120
 
 ## Known limitations
 
-- `temp_get()` now enforces a hard memory cap (default 10 MiB) and will refuse
-  to return content larger than that limit.  Use `temp_get_file()` for large or
-  binary files — it streams directly to disk with memory usage bounded by
-  `chunk_size` (default 8 MiB).
-- `logout()`, `system_stats()`, `schedule_archive_check_sums()`, and
-  `schedule_archive_del()` are not yet implemented upstream.
+- `temp_get()` enforces a hard 10 MiB memory cap and will refuse to return
+  larger content.  Use `temp_get_file()` for large or binary files.
+- `stat()` returns `None` for files that are in archive (offline) storage.
+  Use the resources listing API directly if you need to enumerate archived files.
+- `system_stats()`, `schedule_archive_check_sums()`, and `schedule_archive_del()`
+  are not yet implemented upstream.
 
 ---
 
