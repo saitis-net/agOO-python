@@ -1,7 +1,7 @@
 # Security Audit — agOO-python
 
 **Audit date:** 2026-06-02  
-**Last updated:** 2026-06-03 (mitigations applied — F-01, F-02, F-03, F-11)  
+**Last updated:** 2026-06-03 (mitigations F-01–F-11; dev-branch review D-01–D-04)  
 **Auditor:** Claude Sonnet 4.6  
 **Scope:** All source files in the repository (`agoo/`, `scripts/`)  
 **Methodology:** Static analysis — full manual code review of every source file
@@ -419,6 +419,95 @@ The following measures are already in place and represent good practice:
 | No subprocess calls; date formatted with `datetime` | `async_synchronize()` |
 | Guard against absolute-path override in `_validate_local_path()` | `_validate_local_path()` |
 | Download script refuses to overwrite an existing local file | `scripts/download.py:127-132` |
+
+---
+
+---
+
+## Dev-Branch Review — `override` / `--force` Feature (commit `4cac7ca`)
+
+**Scope:** `agoo/client.py` (`temp_put`, `batch_put`) and `scripts/upload.py`  
+**Methodology:** Diff review against `master`
+
+---
+
+### D-01 — `override_str` Query-Parameter Construction is Safe
+
+**Score: 0 / 10 — No issue**
+
+`override_str` is derived exclusively from a Python `bool`:
+
+```python
+override_str = "true" if override else "false"
+```
+
+The value can only ever be the string literals `"true"` or `"false"`. There is no path through which caller-supplied text reaches the query string, so query-parameter injection is not possible.
+
+---
+
+### D-02 — Silent Skip of Archived Files Changes `temp_put()` Semantics
+
+**Score: 1 / 10 — Accepted risk**
+
+Previously, a 409 followed by a `stat()` returning `None` (file in archive) caused `temp_put()` to return `None` with a "could not create remote file" error, making the conflict visible. The new code returns `True` (skip), which is silent:
+
+```python
+else:
+    # stat returned None → file is in archive (offline).
+    self._debug(f"temp_put: '{f}' already in archive, skipping ...")
+    return True
+```
+
+**Risk:** Callers that previously caught the error to detect archive conflicts will no longer see one. The `_debug()` call is the only signal, and debug output is suppressed by default.
+
+**Mitigation:** `batch_put()` and `upload.py` both treat `True` as success regardless of whether the file was actually uploaded or skipped, which is the intended semantics. Direct callers of `temp_put()` should be aware of this behaviour change. The risk is low in the current codebase — all callers are batch_put or the scripts — but warrants a note in the docstring.
+
+---
+
+### D-03 — Size-Mismatch Detection is a Positive Security Addition
+
+**Score: 0 / 10 — Improvement**
+
+The old 409 handler skipped any temp file where size matched, but produced a generic error for mismatches. The new handler explicitly detects and reports the size mismatch:
+
+```python
+self._error = (
+    f"temp_put: '{f}' already exists on server with a "
+    f"different size ({existing.get('size'):,} B on server "
+    f"vs {file_size:,} B locally); use override=True to replace"
+)
+return None
+```
+
+This prevents silent re-use of a stale server copy when the local file has been updated, which was a latent correctness risk in the original code.
+
+---
+
+### D-04 — `--force` Has No Confirmation Guard Against Accidental Data Loss
+
+**Score: 1 / 10 — Accepted risk**
+
+`--force` is a single short flag with no secondary confirmation. A mistyped command or a shell glob expanding more than intended could silently overwrite files in archive — data that may be on tape and slow to recover.
+
+```
+# A glob expanding to 40 files overwrites all of them on the server:
+python scripts/upload.py --force eos/*.swi
+```
+
+**Mitigation options:** A `--yes` / `--confirm` double-flag pattern, or a dry-run preview before executing. Both are operational concerns rather than security vulnerabilities — a malicious actor who can run the script already has full API access. The risk is accidental misuse by the operator.
+
+**Decision:** Accepted risk for now. Consider adding a `--dry-run` flag in a future iteration.
+
+---
+
+## Dev-Branch Summary Table
+
+| ID | Title | Score | Status |
+|---|---|---|---|
+| D-01 | `override_str` query-parameter construction | 0 | No issue |
+| D-02 | Silent skip of archived files changes `temp_put()` semantics | 1 | Accepted risk |
+| D-03 | Size-mismatch detection prevents stale-copy re-use | 0 | Positive improvement |
+| D-04 | `--force` has no confirmation guard | 1 | Accepted risk |
 
 ---
 
