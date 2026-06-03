@@ -183,39 +183,41 @@ This matches the Perl behaviour and prevents path components from being interpre
 
 ### F-05 — Unbounded Response Body Buffering in Non-Streaming API Calls
 
-**Score: 3 / 10**  
-**File:** `agoo/client.py:321-445` (`_do()`), called by `stat()`, `get_usage()`, `login()`, `temp_sum()`
+**Score: 3 / 10 → residual: 0 / 10 (fully mitigated)**  
+**Status: RESOLVED — commit `106aa43`**  
+**File:** `agoo/client.py:_do()`
 
 #### Description
 
-`_do()` uses `stream=False` by default, which instructs `requests` to download and buffer the complete response body before returning. For API calls that are expected to return small JSON blobs (`stat`, `get_usage`, `login`, `temp_sum`), no size limit is enforced on the response:
+`_do()` previously used `stream=False` by default, instructing `requests` to download and buffer the complete response body before returning. For API calls expected to return small JSON blobs (`stat`, `get_usage`, `login`, `temp_sum`), no size limit was enforced. A compromised or malicious server could respond with a multi-gigabyte body, exhausting the process's memory.
+
+`temp_get()` already addressed this for file downloads (with a `max_bytes` cap and streaming); the fix was not extended to the other methods.
+
+#### Mitigation applied (commit `106aa43`, 2026-06-03)
+
+`_do()` now always passes `stream=True` to `requests` internally. For non-streaming callers, the response body is consumed iteratively with a hard 1 MiB cap before being stored back into the response object so callers can still use `response.text`:
 
 ```python
-response = self._session.request(method, url, data=body,
-                                  headers=headers, timeout=_DEFAULT_TIMEOUT,
-                                  stream=stream)   # stream=False for most calls
+if not stream:
+    _MAX_API_BODY = 1 * 1024 * 1024  # 1 MiB
+    cl = response.headers.get("Content-Length")
+    if cl and int(cl) > _MAX_API_BODY:
+        response.close()
+        self._error = f"{path}: response too large ({cl} bytes)"
+        return None
+    chunks, total = [], 0
+    for chunk in response.iter_content(chunk_size=65536):
+        total += len(chunk)
+        if total > _MAX_API_BODY:
+            response.close()
+            self._error = f"{path}: response body exceeded {_MAX_API_BODY} bytes"
+            return None
+        chunks.append(chunk)
+    response._content = b"".join(chunks)
+    response._content_consumed = True
 ```
 
-A compromised or malicious server can respond to `GET /api/usage` with a 10 GB body. The `requests` library will buffer the entire payload before returning, exhausting the process's memory.
-
-`temp_get()` correctly addresses this for file downloads (with a `max_bytes` cap and streaming), but the fix was not extended to the other methods.
-
-#### Impact
-
-Denial-of-service against the calling process. Does not directly enable data exfiltration or code execution. Requires the server to be compromised or a MITM on the connection.
-
-#### Recommendation
-
-Set a hard response-size limit in `_do()` for non-streaming paths, either by switching those calls to `stream=True` and capping the read, or by checking `Content-Length` before calling `response.text`:
-
-```python
-MAX_API_RESPONSE = 1 * 1024 * 1024  # 1 MiB is generous for any metadata call
-cl = response.headers.get("Content-Length")
-if cl and int(cl) > MAX_API_RESPONSE:
-    response.close()
-    self._error = f"{path}: response too large ({cl} bytes)"
-    return None
-```
+The `Content-Length` pre-check provides an early exit without reading any bytes; the iterative cap handles servers that omit or falsify `Content-Length`.
 
 ---
 
@@ -402,7 +404,7 @@ Scores show original / residual. "—" residual means the finding is fully close
 | F-02 | `X-Auth` token forwarded on cross-domain HTTP redirects | **4** | — | **Resolved** (`f1331e4`) | `client.py:_SafeSession` |
 | F-03 | Arbitrary local file write in `temp_get_file()` | **4** | — | **Resolved** (`f1331e4`) | `client.py:_validate_output_path()` |
 | F-04 | Remote path traversal via unencoded `..` in `uri_escape` | **3** | **3** | Open | `client.py` (all remote-path calls) |
-| F-05 | Unbounded response body buffering in non-streaming API calls | **3** | **3** | Open | `client.py:_do()` |
+| F-05 | Unbounded response body buffering in non-streaming API calls | **3** | — | **Resolved** (`106aa43`) | `client.py:_do()` |
 | F-06 | TOCTOU race between path validation and `open()` | **2** | **2** | Open | `client.py:temp_put()` |
 | F-07 | Predictable sentinel path enables local symlink attack | **2** | **2** | Open | `client.py:async_synchronize()` |
 | F-08 | `Referer` header leaks API username to `start_url` | **1** | **1** | Open | `client.py:_do()` |
@@ -439,10 +441,10 @@ The following measures are already in place and represent good practice:
 
 1. **Rotate the agOO password and rewrite git history** (F-01 residual). Source code is clean, but `git log -p` on any clone made before `c7a2feb` still reveals the plaintext password. Use `git filter-repo --replace-text` and force-push (or re-create) the repository.
 2. **Switch to `safe=''` in `uri_escape`** to match Perl semantics and prevent server-side path traversal (F-04). One-line fix.
-3. **Cap response body size in `_do()`** to prevent OOM on compromised-server responses (F-05).
-4. Remaining findings (F-06 through F-10) are low priority and can be addressed in a single hardening pass.
+3. Remaining findings (F-06 through F-10) are low priority and can be addressed in a single hardening pass.
 
 ### Resolved
 - ~~F-02~~ — `_SafeSession` strips `X-Auth` on cross-origin redirects.
 - ~~F-03~~ — `_validate_output_path()` guards `temp_get_file()` against path traversal writes.
+- ~~F-05~~ — `_do()` buffers non-streaming responses iteratively with a 1 MiB cap.
 - ~~F-11~~ — `_upload_eos.py` deleted.
