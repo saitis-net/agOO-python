@@ -109,36 +109,30 @@ class _SafeSession(requests.Session):
 
 ---
 
-### F-03 — Arbitrary Local File Write in `temp_get_file()` (No Output Path Validation)
+### F-03 — Path Validation Asymmetry Between Upload and Download
 
 **Score: 4 / 10 → residual: 0 / 10 (fully mitigated)**  
-**Status: RESOLVED — commit `f1331e4`**  
-**File:** `agoo/client.py:264-290`, `agoo/client.py:1267`
+**Status: RESOLVED — commits `f1331e4`, `1a6efd0`**  
+**File:** `agoo/client.py:242-270`, `agoo/client.py:1267`
 
 #### Description
 
-`temp_put()` calls `_validate_local_path()` before opening any local file, rejecting null bytes and paths that resolve outside the current working directory. `temp_get_file()` — which writes to a caller-supplied `local_path` — previously applied no equivalent validation, silently accepting paths such as `../../.ssh/authorized_keys`.
+The library had a two-sided path validation asymmetry:
 
-#### Mitigation applied (commit `f1331e4`, 2026-06-02)
+- **Download side (`temp_get_file`):** wrote to a caller-supplied `local_path` with no validation, silently accepting paths such as `../../.ssh/authorized_keys`.
+- **Upload side (`temp_put` / `batch_put`):** called `_validate_local_path()` which rejected not only relative traversal but also all absolute paths, preventing callers from uploading files outside the current working directory (e.g. `/mnt/nas/backup.tar.gz`).
 
-A new `_validate_output_path()` static method was added to `Agoo` (`client.py:264`) and called at the top of `temp_get_file()` before any network I/O (`client.py:1267`).
+#### Mitigation applied
 
-The validator is deliberately less restrictive than `_validate_local_path()` to support legitimate use cases such as writing to external mounts:
+**Download side (commit `f1331e4`, 2026-06-02):** A new `_validate_output_path()` static method was added (`client.py:272`) and called at the top of `temp_get_file()` before any network I/O (`client.py:1267`). It rejects null bytes and relative traversal, but permits absolute paths.
+
+**Upload side (commit `1a6efd0`, 2026-06-03):** `_validate_local_path()` was updated to match the same policy — absolute paths are now permitted; only relative paths that escape the CWD are rejected. This mirrors `_validate_output_path()` and was discovered during integration testing when uploading files by absolute path.
+
+Both validators now apply the same rule:
 
 - **Null bytes:** always rejected.
-- **Relative traversal:** relative paths that resolve outside the CWD (e.g. `../../etc/passwd`) are rejected.
-- **Absolute paths:** permitted — the caller is assumed to have explicitly chosen the destination (e.g. `/mnt/nas/backup.tar.gz`).
-
-```python
-@staticmethod
-def _validate_output_path(path: str) -> None:
-    if "\x00" in path:
-        raise ValueError(f"output path contains a null byte: {path!r}")
-    if not os.path.isabs(path):
-        cwd = Path.cwd().resolve()
-        resolved = (cwd / path).resolve()
-        resolved.relative_to(cwd)   # raises ValueError if outside CWD
-```
+- **Relative traversal:** rejected (e.g. `../../etc/shadow`).
+- **Absolute paths:** permitted — the caller explicitly chose the location.
 
 ---
 
@@ -395,7 +389,7 @@ Scores show original / residual. "—" residual means the finding is fully close
 |---|---|---|---|---|---|
 | F-01 | Plaintext credentials in version-controlled files and git history | **7** | **3** | Partial — source fixed, history not rewritten | `scripts/*.py` |
 | F-02 | `X-Auth` token forwarded on cross-domain HTTP redirects | **4** | — | **Resolved** (`f1331e4`) | `client.py:_SafeSession` |
-| F-03 | Arbitrary local file write in `temp_get_file()` | **4** | — | **Resolved** (`f1331e4`) | `client.py:_validate_output_path()` |
+| F-03 | Path validation asymmetry between upload and download | **4** | — | **Resolved** (`f1331e4`, `1a6efd0`) | `client.py:_validate_local_path()`, `_validate_output_path()` |
 | F-04 | Remote paths with unencoded `/` | **3** | N/A | **By design** — intentional API feature | `client.py:uri_escape` |
 | F-05 | Unbounded response body buffering in non-streaming API calls | **3** | — | **Resolved** (`106aa43`) | `client.py:_do()` |
 | F-06 | TOCTOU race between path validation and `open()` | **2** | N/A | **Accepted risk** | `client.py:temp_put()` |
