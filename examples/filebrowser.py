@@ -1,0 +1,977 @@
+#!/usr/bin/env python3
+"""examples/filebrowser.py — Interactive split-pane TUI for agOO storage.
+
+Layout
+------
+  ┌ Local: /home/user ──────────┬ Remote: /eos ────────────────┐
+  │ ..                          │ ..                           │
+  │ dir/                  4 KB  │   dir/                       │
+  │ file.tar.gz         1.2 GB  │ ● online.gz        3.4 GB   │ ← bold
+  │ [+] queued.gz     512.0 MB  │ ○ archived.gz      5.6 GB   │ ← dim
+  │                             │ ↑ recalled.gz      7.8 GB   │ ← italic
+  └─────────────────────────────┴──────────────────────────────┘
+   Tab:switch  ↑↓/jk:move  Space:mark  Enter:menu  r:refresh  ⌫:up
+   s:upload N pending  q:quit
+   ✓ Ready
+
+Local pane
+----------
+  [+] green   File is queued for upload (press 's' to start)
+  Space       Toggle upload queue for the file under the cursor
+  Enter       On a file   → Mark / Unmark for upload
+              On a folder → Browse  or  Mark folder for upload
+
+Remote pane
+-----------
+  Bold   ● file is in temp (cache) — available for Download
+  Dim    ○ file is in archive — available for Retrieve
+  Italic ↑ archive recall in progress
+
+  Enter  On a file (cache)   → Download to local
+         On a file (archive) → Retrieve from archive (recall + download)
+         On a file (pending) → status info only
+         On a folder         → Browse  or  Mark folder for retrieval
+
+  s      (local pane only) Upload all queued files
+
+Credentials
+-----------
+  Reads agOO_USER and agOO_PASSWORD from environment variables.
+"""
+
+import curses
+import os
+import queue
+import sys
+import threading
+import time
+from dataclasses import dataclass
+from pathlib import Path
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+from agoo import Agoo
+
+_USER     = os.environ.get("agOO_USER")
+_PASSWORD = os.environ.get("agOO_PASSWORD")
+
+# Internal agOO sentinel directory — hidden from the remote pane.
+_HIDDEN_NAMES = {"_sgbdb"}
+
+
+# ── Helpers ────────────────────────────────────────────────────────────────────
+
+def _fmt_size(n: int) -> str:
+    for unit, thr in (("GB", 1 << 30), ("MB", 1 << 20), ("KB", 1 << 10)):
+        if n >= thr:
+            return f"{n / thr:.1f} {unit}"
+    return f"{n} B"
+
+
+# ── Local pane ─────────────────────────────────────────────────────────────────
+
+@dataclass
+class _LocalEntry:
+    path: Path
+    name: str
+    is_dir: bool
+    size: int
+
+
+class LocalPane:
+    """Left pane: browse the local filesystem."""
+
+    def __init__(self, win, start: Path) -> None:
+        self.win = win
+        self.path = start.resolve()
+        self.entries: list[_LocalEntry] = []
+        self.cursor = 0
+        self.scroll = 0
+        self.error: str | None = None
+        self.refresh()
+
+    def refresh(self) -> None:
+        self.error = None
+        items: list[_LocalEntry] = []
+        if self.path != self.path.parent:
+            items.append(_LocalEntry(self.path.parent, "..", True, 0))
+        try:
+            children = sorted(
+                (p for p in self.path.iterdir() if not p.name.startswith(".")),
+                key=lambda p: (not p.is_dir(), p.name.lower()),
+            )
+            for p in children:
+                try:
+                    size = 0 if p.is_dir() else p.stat().st_size
+                except OSError:
+                    size = 0
+                items.append(_LocalEntry(p, p.name, p.is_dir(), size))
+        except PermissionError as exc:
+            self.error = str(exc)
+        self.entries = items
+        self._clamp()
+
+    def _clamp(self) -> None:
+        if self.cursor >= len(self.entries):
+            self.cursor = max(0, len(self.entries) - 1)
+
+    def _visible(self) -> int:
+        return self.win.getmaxyx()[0] - 2
+
+    def move_up(self) -> None:
+        if self.cursor > 0:
+            self.cursor -= 1
+            if self.cursor < self.scroll:
+                self.scroll = self.cursor
+
+    def move_down(self) -> None:
+        if self.cursor < len(self.entries) - 1:
+            self.cursor += 1
+            vis = self._visible()
+            if self.cursor >= self.scroll + vis:
+                self.scroll = self.cursor - vis + 1
+
+    def current_entry(self) -> _LocalEntry | None:
+        if 0 <= self.cursor < len(self.entries):
+            return self.entries[self.cursor]
+        return None
+
+    def enter_dir(self) -> None:
+        e = self.current_entry()
+        if e and e.is_dir:
+            self.path = e.path.resolve()
+            self.cursor = self.scroll = 0
+            self.refresh()
+
+    def go_up(self) -> None:
+        if self.path != self.path.parent:
+            self.path = self.path.parent
+            self.cursor = self.scroll = 0
+            self.refresh()
+
+    def draw(self, active: bool, active_pair: int,
+             pending_up: set[str], pending_pair: int) -> None:
+        win = self.win
+        h, w = win.getmaxyx()
+        win.erase()
+        win.border()
+
+        title = f" Local: {self.path} "
+        title_attr = curses.A_BOLD | (curses.color_pair(active_pair) if active else curses.A_NORMAL)
+        try:
+            win.addstr(0, 2, title[:w - 4], title_attr)
+        except curses.error:
+            pass
+
+        if self.error:
+            try:
+                win.addstr(1, 2, f"Error: {self.error}"[:w - 4], curses.A_DIM)
+            except curses.error:
+                pass
+            win.noutrefresh()
+            return
+
+        vis = self._visible()
+        size_w = 10
+
+        for i in range(vis):
+            idx = self.scroll + i
+            if idx >= len(self.entries):
+                break
+            e   = self.entries[idx]
+            row = i + 1
+
+            queued = (not e.is_dir) and str(e.path) in pending_up
+            marker = "[+] " if queued else "    "
+            label  = (e.name + "/") if e.is_dir else e.name
+            size_s = "" if e.is_dir else _fmt_size(e.size)
+            avail  = w - 2 - len(marker) - 1
+            name_w = avail - size_w - 1
+            line   = marker + label[:name_w].ljust(name_w) + " " + size_s.rjust(size_w)
+
+            attr = curses.A_BOLD if e.is_dir else curses.A_NORMAL
+            if queued:
+                attr |= curses.color_pair(pending_pair)
+            if idx == self.cursor:
+                attr |= curses.A_REVERSE
+            try:
+                win.addstr(row, 1, line[:w - 2], attr)
+            except curses.error:
+                pass
+
+        win.noutrefresh()
+
+
+# ── Remote pane ────────────────────────────────────────────────────────────────
+
+class RemotePane:
+    """Right pane: browse the agOO remote storage."""
+
+    def __init__(self, win, client: Agoo, pending_recalls: set[str]) -> None:
+        self.win = win
+        self.client = client
+        self.pending_recalls = pending_recalls
+        self.remote_path = ""
+        self.entries: list[dict] = []
+        self.cursor = 0
+        self.scroll = 0
+        self.error: str | None = None
+        self.refresh()
+
+    def refresh(self) -> None:
+        self.error = None
+        raw = self.client.list_resources(self.remote_path)
+        if raw is None:
+            self.error = self.client.error() or "listing failed"
+            self.entries = []
+            return
+        self._build(raw)
+
+    def _build(self, items: list[dict]) -> None:
+        result: list[dict] = []
+        for item in items:
+            name = item.get("name", "")
+            if name in _HIDDEN_NAMES:
+                continue
+            api_path = item.get("path", "").lstrip("/")
+            result.append({**item, "display_name": name, "api_path": api_path})
+
+        result.sort(key=lambda e: (not e.get("isDir", False),
+                                   e.get("display_name", "").lower()))
+        self.entries = []
+        if self.remote_path:
+            self.entries.append({
+                "name": "..", "display_name": "..", "api_path": "",
+                "isDir": True, "isOffline": False, "size": 0,
+                "unarchiveAsked": False,
+            })
+        self.entries += result
+        self._clamp()
+
+    def _clamp(self) -> None:
+        if self.cursor >= len(self.entries):
+            self.cursor = max(0, len(self.entries) - 1)
+
+    def _visible(self) -> int:
+        return self.win.getmaxyx()[0] - 2
+
+    def move_up(self) -> None:
+        if self.cursor > 0:
+            self.cursor -= 1
+            if self.cursor < self.scroll:
+                self.scroll = self.cursor
+
+    def move_down(self) -> None:
+        if self.cursor < len(self.entries) - 1:
+            self.cursor += 1
+            vis = self._visible()
+            if self.cursor >= self.scroll + vis:
+                self.scroll = self.cursor - vis + 1
+
+    def current_entry(self) -> dict | None:
+        if 0 <= self.cursor < len(self.entries):
+            return self.entries[self.cursor]
+        return None
+
+    def enter_dir(self) -> None:
+        e = self.current_entry()
+        if not e or not e.get("isDir"):
+            return
+        if e["display_name"] == "..":
+            self.remote_path = (self.remote_path.rsplit("/", 1)[0]
+                                if "/" in self.remote_path else "")
+        else:
+            self.remote_path = e.get("api_path", e.get("name", ""))
+        self.cursor = self.scroll = 0
+        self.refresh()
+
+    def go_up(self) -> None:
+        if self.remote_path:
+            self.remote_path = (self.remote_path.rsplit("/", 1)[0]
+                                if "/" in self.remote_path else "")
+            self.cursor = self.scroll = 0
+            self.refresh()
+
+    def draw(self, active: bool, active_pair: int, italic_attr: int) -> None:
+        win = self.win
+        h, w = win.getmaxyx()
+        win.erase()
+        win.border()
+
+        path_label = ("/" + self.remote_path) if self.remote_path else "/"
+        title = f" Remote: {path_label} "
+        title_attr = curses.A_BOLD | (curses.color_pair(active_pair) if active else curses.A_NORMAL)
+        try:
+            win.addstr(0, 2, title[:w - 4], title_attr)
+        except curses.error:
+            pass
+
+        if self.error:
+            try:
+                win.addstr(1, 2, f"Error: {self.error}"[:w - 4], curses.A_DIM)
+            except curses.error:
+                pass
+            win.noutrefresh()
+            return
+
+        vis = self._visible()
+        size_w = 10
+
+        for i in range(vis):
+            idx = self.scroll + i
+            if idx >= len(self.entries):
+                break
+            e   = self.entries[idx]
+            row = i + 1
+
+            is_dir     = e.get("isDir", False)
+            is_offline = e.get("isOffline", False)
+            api_path   = e.get("api_path", "")
+            display    = e.get("display_name", e.get("name", ""))
+            pending    = e.get("unarchiveAsked", False) or api_path in self.pending_recalls
+
+            if is_dir:
+                indicator = "  "
+                label     = display + "/"
+                attr      = curses.A_BOLD
+            elif pending:
+                indicator = "↑ "
+                label     = display
+                attr      = italic_attr
+            elif not is_offline:
+                indicator = "● "
+                label     = display
+                attr      = curses.A_BOLD
+            else:
+                indicator = "○ "
+                label     = display
+                attr      = curses.A_DIM
+
+            if idx == self.cursor:
+                attr |= curses.A_REVERSE
+
+            size_s = "" if is_dir else _fmt_size(e.get("size", 0))
+            avail  = w - 2 - 2 - len(indicator) - 1   # 2 for border, 2 for left margin
+            name_w = avail - size_w - 1
+            line   = "  " + indicator + label[:name_w].ljust(name_w) + " " + size_s.rjust(size_w)
+            try:
+                win.addstr(row, 1, line[:w - 2], attr)
+            except curses.error:
+                pass
+
+        win.noutrefresh()
+
+
+# ── Context menu ───────────────────────────────────────────────────────────────
+
+def show_menu(stdscr, title: str, options: list[str]) -> str | None:
+    """Centred popup menu. Returns the chosen option string, or None on Escape."""
+    if not options:
+        return None
+    h, w = stdscr.getmaxyx()
+    inner_w = max(len(title), max(len(o) for o in options))
+    menu_w  = min(inner_w + 6, w - 2)
+    menu_h  = len(options) + 4
+    y = max(0, (h - menu_h) // 2)
+    x = max(0, (w - menu_w) // 2)
+
+    win = curses.newwin(menu_h, menu_w, y, x)
+    win.keypad(True)
+    cursor = 0
+
+    while True:
+        win.erase()
+        win.border()
+        try:
+            win.addstr(1, max(1, (menu_w - len(title)) // 2),
+                       title[:menu_w - 4], curses.A_BOLD)
+        except curses.error:
+            pass
+        for i, opt in enumerate(options):
+            attr = curses.A_REVERSE if i == cursor else curses.A_NORMAL
+            try:
+                win.addstr(i + 3, 3, opt[:menu_w - 6].ljust(menu_w - 6), attr)
+            except curses.error:
+                pass
+        win.noutrefresh()
+        curses.doupdate()
+
+        key = win.getch()
+        if key in (curses.KEY_UP, ord('k')) and cursor > 0:
+            cursor -= 1
+        elif key in (curses.KEY_DOWN, ord('j')) and cursor < len(options) - 1:
+            cursor += 1
+        elif key in (curses.KEY_ENTER, ord('\n'), ord('\r')):
+            del win
+            return options[cursor]
+        elif key == 27:
+            del win
+            return None
+
+    return None   # unreachable
+
+
+# ── Main application ───────────────────────────────────────────────────────────
+
+class FileBrowser:
+
+    def __init__(self, stdscr, client: Agoo) -> None:
+        self.stdscr = stdscr
+        self.client = client
+        self.pending_recalls: set[str] = set()   # api_paths with active recall
+        self.pending_uploads: set[str] = set()   # absolute local paths queued for upload
+        self.status = "Ready"
+        self.busy   = False                      # True while upload/download blocks UI
+        self.msg_q: queue.Queue = queue.Queue()
+
+        curses.start_color()
+        curses.use_default_colors()
+        curses.init_pair(1, curses.COLOR_CYAN,   -1)   # active pane title
+        curses.init_pair(2, curses.COLOR_YELLOW, -1)   # status bar
+        curses.init_pair(3, curses.COLOR_GREEN,  -1)   # queued-for-upload items
+
+        self._italic = getattr(curses, "A_ITALIC", curses.A_UNDERLINE)
+
+        self._init_layout()
+
+    def _init_layout(self) -> None:
+        h, w = self.stdscr.getmaxyx()
+        pane_h  = h - 2
+        left_w  = w // 2
+        right_w = w - left_w
+
+        left_win  = curses.newwin(pane_h, left_w,  0, 0)
+        right_win = curses.newwin(pane_h, right_w, 0, left_w)
+        left_win.keypad(True)
+        right_win.keypad(True)
+
+        prev_local  = getattr(self, '_local_pane',  None)
+        prev_remote = getattr(self, '_remote_pane', None)
+
+        self._local_pane  = LocalPane(left_win,
+                                      prev_local.path if prev_local else Path.home())
+        self._remote_pane = RemotePane(right_win, self.client, self.pending_recalls)
+
+        if prev_remote and prev_remote.remote_path:
+            self._remote_pane.remote_path = prev_remote.remote_path
+            self._remote_pane.refresh()
+
+        self.active = getattr(self, 'active', 0)
+
+    # ── Drawing ────────────────────────────────────────────────────────────────
+
+    def _draw_hints(self) -> None:
+        h, w = self.stdscr.getmaxyx()
+        n = len(self.pending_uploads)
+        if self.active == 0:
+            s_hint = f"s:upload ({n} pending)" if n else "s:upload pending"
+        else:
+            s_hint = "s:sync archive"
+        hints = (f" Tab:switch  ↑↓/jk:move  Space:mark  u:unmark all  "
+                 f"Enter:menu  r:refresh  ⌫:up  {s_hint}  q:quit")
+        try:
+            self.stdscr.addstr(h - 2, 0, hints[:w - 1].ljust(w - 1), curses.A_REVERSE)
+        except curses.error:
+            pass
+
+    def _draw_status(self) -> None:
+        h, w = self.stdscr.getmaxyx()
+        icon = " ⟳ " if self.busy else " ✓ "
+        line = (icon + self.status)[:w - 1].ljust(w - 1)
+        try:
+            self.stdscr.addstr(h - 1, 0, line, curses.color_pair(2))
+        except curses.error:
+            pass
+        self.stdscr.noutrefresh()
+
+    def _draw_all(self) -> None:
+        self.stdscr.erase()
+        self._draw_hints()
+        self._draw_status()
+        self._local_pane.draw(self.active == 0, 1, self.pending_uploads, 3)
+        self._remote_pane.draw(self.active == 1, 1, self._italic)
+        curses.doupdate()
+
+    def _set_status(self, msg: str, busy: bool = False) -> None:
+        self.status = msg
+        self.busy   = busy
+        self._draw_status()
+        curses.doupdate()
+
+    # ── Event loop ─────────────────────────────────────────────────────────────
+
+    def run(self) -> None:
+        self.stdscr.nodelay(True)
+        self._draw_all()
+
+        while True:
+            # Drain the worker-thread message queue.
+            changed = False
+            while not self.msg_q.empty():
+                kind, data = self.msg_q.get_nowait()
+                if kind == "status":
+                    # Blocking operation progress update.
+                    self._set_status(data, busy=True)
+                elif kind == "done":
+                    # Blocking operation finished successfully.
+                    self.busy = False
+                    self._set_status(data)
+                    changed = True
+                elif kind == "error":
+                    # Blocking operation failed.
+                    self.busy = False
+                    self._set_status(f"Error: {data}")
+                    changed = True
+                elif kind == "recall_done":
+                    # Background recall+download finished (non-blocking).
+                    if not self.busy:
+                        self._set_status(data)
+                    changed = True
+                elif kind == "recall_status":
+                    # Background recall progress (non-blocking).
+                    if not self.busy:
+                        self._set_status(data)
+                elif kind == "recall_error":
+                    # Background recall failed (non-blocking).
+                    if not self.busy:
+                        self._set_status(f"Recall error: {data}")
+
+            if changed:
+                self._remote_pane.refresh()
+                self._local_pane.refresh()
+                self._draw_all()
+
+            key = self.stdscr.getch()
+            if key == -1:
+                curses.napms(50)
+                continue
+
+            # While a blocking operation runs, only allow quit.
+            if self.busy:
+                if key in (ord('q'), ord('Q')):
+                    break
+                continue
+
+            if key in (ord('q'), ord('Q')):
+                break
+            elif key == curses.KEY_RESIZE:
+                self._init_layout()
+                self._draw_all()
+            elif key == ord('\t'):
+                self.active = 1 - self.active
+                self._draw_all()
+            elif key in (curses.KEY_UP, ord('k')):
+                self._active_pane().move_up()
+                self._draw_all()
+            elif key in (curses.KEY_DOWN, ord('j')):
+                self._active_pane().move_down()
+                self._draw_all()
+            elif key == ord(' '):
+                self._handle_space()
+            elif key in (curses.KEY_ENTER, ord('\n'), ord('\r')):
+                self._handle_enter()
+            elif key in (curses.KEY_BACKSPACE, 127):
+                self._active_pane().go_up()
+                self._draw_all()
+            elif key in (ord('r'), curses.KEY_F5):
+                self._active_pane().refresh()
+                self._draw_all()
+            elif key == ord('u'):
+                if self.active == 0:
+                    n = len(self.pending_uploads)
+                    self.pending_uploads.clear()
+                    self._set_status(f"Cleared {n} pending upload(s).")
+                else:
+                    n = len(self.pending_recalls)
+                    self.pending_recalls.clear()
+                    self._set_status(f"Cleared {n} pending recall(s).")
+                self._draw_all()
+            elif key == ord('s'):
+                if self.active == 0:
+                    self._trigger_upload()
+                else:
+                    self._trigger_sync()
+
+    def _active_pane(self):
+        return self._local_pane if self.active == 0 else self._remote_pane
+
+    # ── Space key — toggle upload queue ───────────────────────────────────────
+
+    def _handle_space(self) -> None:
+        if self.active != 0:
+            return
+        e = self._local_pane.current_entry()
+        if not e or e.is_dir:
+            return
+        p = str(e.path)
+        if p in self.pending_uploads:
+            self.pending_uploads.discard(p)
+            self._set_status(f"Unmarked: {e.name}  ({len(self.pending_uploads)} pending)")
+        else:
+            self.pending_uploads.add(p)
+            self._set_status(
+                f"Queued: {e.name}  ({len(self.pending_uploads)} pending — press 's' to upload)"
+            )
+        self._draw_all()
+
+    # ── Enter key ──────────────────────────────────────────────────────────────
+
+    def _handle_enter(self) -> None:
+        if self.active == 0:
+            self._handle_local_enter()
+        else:
+            self._handle_remote_enter()
+
+    def _handle_local_enter(self) -> None:
+        pane = self._local_pane
+        e    = pane.current_entry()
+        if e is None:
+            return
+
+        if e.is_dir:
+            # '..' navigates directly without a menu.
+            if e.name == "..":
+                pane.go_up()
+                self._draw_all()
+                return
+
+            choice = show_menu(self.stdscr, f"{e.name}/",
+                               ["Browse", "Mark folder for upload", "Cancel"])
+            self._draw_all()
+            if choice == "Browse":
+                pane.enter_dir()
+                self._draw_all()
+            elif choice == "Mark folder for upload":
+                self._mark_local_folder(e.path)
+            return
+
+        # File — mark / unmark for deferred upload.
+        p       = str(e.path)
+        queued  = p in self.pending_uploads
+        label   = "Unmark" if queued else "Mark for upload"
+        choice  = show_menu(self.stdscr, e.name, [label, "Cancel"])
+        self._draw_all()
+        if choice == label:
+            if queued:
+                self.pending_uploads.discard(p)
+                self._set_status(f"Unmarked: {e.name}  ({len(self.pending_uploads)} pending)")
+            else:
+                self.pending_uploads.add(p)
+                self._set_status(
+                    f"Queued: {e.name}  ({len(self.pending_uploads)} pending — press 's' to upload)"
+                )
+            self._draw_all()
+
+    def _handle_remote_enter(self) -> None:
+        pane = self._remote_pane
+        e    = pane.current_entry()
+        if e is None:
+            return
+
+        if e.get("isDir"):
+            # '..' navigates directly without a menu.
+            if e.get("display_name") == "..":
+                pane.go_up()
+                self._draw_all()
+                return
+
+            folder_name = e.get("display_name", "")
+            folder_path = e.get("api_path", e.get("name", ""))
+            choice = show_menu(self.stdscr, f"{folder_name}/",
+                               ["Browse",
+                                "Download folder",
+                                "Mark folder for retrieval",
+                                "Cancel"])
+            self._draw_all()
+            if choice == "Browse":
+                pane.enter_dir()
+                self._draw_all()
+            elif choice == "Download folder":
+                self._download_folder(folder_path, folder_name,
+                                      self._local_pane.path)
+            elif choice == "Mark folder for retrieval":
+                self._mark_remote_folder_for_retrieval(folder_path, folder_name)
+            return
+
+        api_path   = e.get("api_path", e.get("path", "").lstrip("/"))
+        display    = e.get("display_name", e.get("name", ""))
+        is_offline = e.get("isOffline", False)
+        # pending is only meaningful for offline files; an online file with
+        # unarchiveAsked=True has already been recalled and is downloadable.
+        pending    = is_offline and (e.get("unarchiveAsked", False)
+                                     or api_path in self.pending_recalls)
+        local_dest = str(self._local_pane.path / display)
+
+        if not is_offline:
+            # File is in cache — Download, Unmark (return to archive), and Delete.
+            choice = show_menu(self.stdscr, f"● {display}",
+                               ["Download to local",
+                                "Unmark (return to archive)",
+                                "Delete from remote",
+                                "Cancel"])
+            self._draw_all()
+            if choice == "Download to local":
+                self._do_download(api_path, display, local_dest)
+            elif choice == "Unmark (return to archive)":
+                self._do_unmark(api_path, display)
+            elif choice == "Delete from remote":
+                self._do_delete(api_path, display)
+        elif pending:
+            # File is offline and a recall is already in progress — info only.
+            show_menu(self.stdscr, f"↑ {display}  (recall in progress)", ["OK"])
+            self._draw_all()
+        else:
+            # File is in archive — Retrieve only.
+            choice = show_menu(self.stdscr, f"○ {display}  (archived)",
+                               ["Retrieve from archive", "Cancel"])
+            self._draw_all()
+            if choice == "Retrieve from archive":
+                self._do_recall(api_path, display)
+
+    # ── Local folder marking ───────────────────────────────────────────────────
+
+    def _collect_local_files(self, path: Path) -> list[str]:
+        """Recursively collect all non-hidden files under path."""
+        result: list[str] = []
+        try:
+            for item in sorted(path.iterdir()):
+                if item.name.startswith("."):
+                    continue
+                if item.is_file():
+                    result.append(str(item))
+                elif item.is_dir():
+                    result.extend(self._collect_local_files(item))
+        except PermissionError:
+            pass
+        return result
+
+    def _mark_local_folder(self, path: Path) -> None:
+        files = self._collect_local_files(path)
+        self.pending_uploads.update(files)
+        self._set_status(
+            f"Queued {len(files)} file(s) from {path.name}/  "
+            f"({len(self.pending_uploads)} total pending — press 's' to upload)"
+        )
+        self._draw_all()
+
+    # ── Remote folder retrieval ────────────────────────────────────────────────
+
+    def _mark_remote_folder_for_retrieval(self, folder_api_path: str,
+                                          folder_display: str) -> None:
+        """Trigger archive recall for every offline file in a remote folder.
+
+        Does NOT download — files are marked ↑ (italic) until they return
+        online.  Use 'Download folder' to download cached files.
+        """
+        def _work() -> None:
+            items = self.client.list_resources(folder_api_path)
+            if items is None:
+                self.msg_q.put(("recall_error",
+                                f"Cannot list {folder_display}/: {self.client.error()}"))
+                return
+
+            offline = [e for e in items
+                       if not e.get("isDir")
+                       and e.get("isOffline")
+                       and not e.get("unarchiveAsked")]
+
+            if not offline:
+                self.msg_q.put(("recall_status",
+                                f"No offline files to retrieve in {folder_display}/."))
+                return
+
+            triggered = 0
+            for item in offline:
+                api_path = item.get("path", "").lstrip("/")
+                self.pending_recalls.add(api_path)
+                if self.client.schedule_unmigrate(api_path) is not None:
+                    triggered += 1
+                else:
+                    self.pending_recalls.discard(api_path)
+
+            self.msg_q.put(("recall_status",
+                            f"Recall triggered for {triggered}/{len(offline)} "
+                            f"file(s) in {folder_display}/  (↑ italic when pending)"))
+
+        threading.Thread(target=_work, daemon=True).start()
+        self._set_status(f"Requesting recall for contents of {folder_display}/…")
+
+    def _download_folder(self, folder_api_path: str, folder_display: str,
+                         local_base: Path) -> None:
+        """Spawn a non-blocking download thread for every cached file in a folder."""
+        def _work() -> None:
+            items = self.client.list_resources(folder_api_path)
+            if items is None:
+                self.msg_q.put(("recall_error",
+                                f"Cannot list {folder_display}/: {self.client.error()}"))
+                return
+
+            online = [e for e in items
+                      if not e.get("isDir") and not e.get("isOffline")]
+
+            if not online:
+                self.msg_q.put(("recall_status",
+                                f"No cached files to download in {folder_display}/."))
+                return
+
+            self.msg_q.put(("recall_status",
+                            f"Spawning {len(online)} download(s) from {folder_display}/…"))
+            for item in online:
+                api_path   = item.get("path", "").lstrip("/")
+                name       = item.get("name", api_path)
+                local_dest = str(local_base / name)
+                threading.Thread(
+                    target=self._download_single,
+                    args=(api_path, name, local_dest),
+                    daemon=True,
+                ).start()
+
+        threading.Thread(target=_work, daemon=True).start()
+        self._set_status(f"Listing {folder_display}/ for download…")
+
+    def _download_single(self, api_path: str, display: str,
+                         local_dest: str) -> None:
+        """Download one cached file without blocking the UI.  Runs in a thread."""
+        ok = self.client.temp_get_file(api_path, local_dest)
+        if ok:
+            self.msg_q.put(("recall_done", f"Downloaded → {local_dest}"))
+        else:
+            self.msg_q.put(("recall_error",
+                            f"Download failed for {display}: {self.client.error()}"))
+
+    # ── Operations ─────────────────────────────────────────────────────────────
+
+    def _do_unmark(self, api_path: str, display: str) -> None:
+        """Remove a file from cache, keeping the archive copy (schedule_migrate)."""
+        ok = self.client.schedule_migrate(api_path)
+        if ok:
+            self._set_status(f"Unmarked: {display}  (returned to archive).")
+            self._remote_pane.refresh()
+            self._draw_all()
+        else:
+            self._set_status(f"Unmark failed: {self.client.error()}")
+
+    def _do_delete(self, api_path: str, display: str) -> None:
+        result = self.client.temp_del(api_path)
+        if result is not None:
+            self._set_status(f"Deleted {display}.")
+            self._remote_pane.refresh()
+            self._draw_all()
+        else:
+            self._set_status(f"Delete failed: {self.client.error()}")
+
+    def _trigger_sync(self) -> None:
+        """Trigger an agOO archive sync from the remote pane ('s' key)."""
+        def _work() -> None:
+            self.msg_q.put(("recall_status", "Triggering archive sync…"))
+            job_id = self.client.async_synchronize()
+            if job_id is None:
+                self.msg_q.put(("recall_error",
+                                f"Sync failed: {self.client.error()}"))
+                return
+            short = job_id[:12]
+            self.msg_q.put(("recall_status", f"Sync job {short}… started"))
+            while True:
+                status = self.client.async_completed(job_id)
+                if status is None:
+                    self.msg_q.put(("recall_status",
+                                    f"Sync job {short}… running"))
+                    time.sleep(30)
+                    continue
+                if status == 0:
+                    self.msg_q.put(("recall_done",
+                                    f"Archive sync completed (job {short})."))
+                else:
+                    self.msg_q.put(("recall_error",
+                                    f"Sync job {short} finished with status {status}"))
+                break
+
+        threading.Thread(target=_work, daemon=True).start()
+        self._set_status("Archive sync triggered — running in background…")
+
+    def _trigger_upload(self) -> None:
+        """Upload all queued files when 's' is pressed."""
+        if not self.pending_uploads:
+            self._set_status("No files queued for upload.  "
+                             "Use Space or Enter on a file to queue it.")
+            return
+        self._do_upload(sorted(self.pending_uploads))
+
+    def _do_upload(self, paths: list[str]) -> None:
+        """Blocking upload — locks the UI until complete."""
+        label = f"{len(paths)} file(s)"
+        self._set_status(f"Uploading {label}…", busy=True)
+
+        def _work() -> None:
+            self.msg_q.put(("status", f"Uploading {label}…"))
+            ok = self.client.batch_put(paths)
+            if ok:
+                self.pending_uploads.difference_update(paths)
+                self.msg_q.put(("done", f"Uploaded {label} successfully."))
+            else:
+                self.msg_q.put(("error", self.client.error() or "upload failed"))
+
+        threading.Thread(target=_work, daemon=True).start()
+
+    def _do_download(self, api_path: str, display: str, local_dest: str) -> None:
+        """Blocking download from cache — locks the UI until complete."""
+        self._set_status(f"Downloading {display}…", busy=True)
+
+        def _work() -> None:
+            self.msg_q.put(("status", f"Downloading {display}…"))
+            ok = self.client.temp_get_file(api_path, local_dest)
+            if ok:
+                self.msg_q.put(("done", f"Downloaded → {local_dest}"))
+            else:
+                self.msg_q.put(("error", self.client.error() or "download failed"))
+
+        threading.Thread(target=_work, daemon=True).start()
+
+    def _do_recall(self, api_path: str, display: str) -> None:
+        """Request an archive recall.  Marks the file ↑ pending; does NOT download."""
+        self.pending_recalls.add(api_path)
+        self._draw_all()
+
+        def _work() -> None:
+            if self.client.schedule_unmigrate(api_path) is not None:
+                self.msg_q.put(("recall_status",
+                                f"Recall requested: {display}  "
+                                f"(refresh pane when ↑ clears, then download)"))
+            else:
+                self.pending_recalls.discard(api_path)
+                self.msg_q.put(("recall_error",
+                                f"Recall failed for {display}: {self.client.error()}"))
+
+        threading.Thread(target=_work, daemon=True).start()
+        self._set_status(f"Recall requested: {display}")
+
+
+# ── Entry point ────────────────────────────────────────────────────────────────
+
+def main() -> None:
+    missing = [n for n, v in (("agOO_USER", _USER), ("agOO_PASSWORD", _PASSWORD)) if not v]
+    if missing:
+        for n in missing:
+            print(f"Error: ${n} is not set.", file=sys.stderr)
+        print("Export agOO_USER and agOO_PASSWORD before running.", file=sys.stderr)
+        sys.exit(1)
+
+    client = Agoo(user=_USER, login="admin", password=_PASSWORD)
+    print("Authenticating…", end="", flush=True)
+    if not client.login():
+        print(f"\nLogin failed: {client.error()}", file=sys.stderr)
+        sys.exit(1)
+    print(" OK")
+
+    try:
+        def _curses_main(stdscr):
+            curses.curs_set(0)
+            stdscr.keypad(True)
+            FileBrowser(stdscr, client).run()
+
+        curses.wrapper(_curses_main)
+    finally:
+        client.logout()
+
+
+if __name__ == "__main__":
+    main()

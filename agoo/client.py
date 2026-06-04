@@ -561,13 +561,13 @@ class Agoo:
         return False
 
     def logout(self) -> None:
-        """Terminate the backend instance and clear the local session token.
+        """Clear the local session token.
 
-        Calls terminate() to shut down the agOO backend, then discards the
-        local auth token so the client object becomes inert. Authenticated
-        calls will raise RuntimeError until login() is called again.
+        Discards the local auth token so the client object becomes inert.
+        Authenticated calls will raise RuntimeError until login() is called again.
+        The backend instance is left running so that other clients (e.g. the
+        web UI) are not affected.
         """
-        self.terminate()
         self._auth_token = None
 
     def __del__(self) -> None:
@@ -605,6 +605,42 @@ class Agoo:
     # -------------------------------------------------------------------
     # Actions on temp storage
     # -------------------------------------------------------------------
+
+    def list_resources(self, path: str = "") -> list[dict] | None:
+        """List the contents of a remote directory.
+
+        Calls GET api/resources/<path> (or api/resources/ for the root) and
+        returns the `items` array from the response.  Each element is a dict
+        that includes at minimum:
+
+          name           : entry basename (e.g. "vEOS-4.31.1F.swi")
+          path           : absolute remote path (e.g. "/eos/vEOS-4.31.1F.swi")
+          size           : file size in bytes
+          isDir          : True for directory entries
+          isOffline      : True when the file is in archive storage
+          unarchiveAsked : True when an archive recall has been requested
+
+        The _get_stream() variant is used so that the 1 MiB non-streaming
+        response cap in _do() does not truncate large directory listings.
+
+        Returns a list of dicts on success, None on failure.
+        """
+        endpoint = ("api/resources/" + uri_escape(path)) if path else "api/resources/"
+        response = self._get_stream(endpoint)
+        if response is None:
+            return None
+        try:
+            data = json.loads(response.text)
+            if isinstance(data, list):
+                return data
+            if isinstance(data, dict):
+                return data.get("items", [])
+            return []
+        except json.JSONDecodeError as exc:
+            self._error = f"list_resources: server returned invalid JSON: {exc}"
+            return None
+        finally:
+            response.close()
 
     def get_usage(self) -> dict | None:
         """Fetch storage usage statistics from the agOO service.
@@ -1393,13 +1429,18 @@ class Agoo:
     # Actions on archive storage (queued until async_synchronize() is called)
     # -------------------------------------------------------------------
 
-    def schedule_migrate(self) -> bool:
-        """Schedule a migration of temp files to archive storage.
+    def schedule_migrate(self, f: str) -> bool:
+        """Remove a file from temp (cache) storage, keeping the archive copy.
 
-        Currently a no-op; migration is handled implicitly by the server.
-        Returns True to indicate "scheduled" (mirrors Perl `return 1`).
+        Calls DELETE api/raw/<path> to discard the cached copy without
+        touching the archive.  After this call the file will appear as
+        isOffline=true in list_resources() and can be recalled with
+        schedule_unmigrate() if needed again.
+
+        Returns True on success, None on failure.
         """
-        return True
+        result = self._delete("api/raw/" + uri_escape(f))
+        return result is not None
 
     def schedule_unmigrate(self, f: str):
         """Schedule a copy of an archive file back to temp storage.
