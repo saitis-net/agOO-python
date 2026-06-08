@@ -326,6 +326,27 @@ python scripts/sync.py --poll-interval 120
 
 ---
 
+## Interactive tools
+
+The `tools/` directory contains an interactive terminal application built on
+the library.
+
+### filebrowser.py — split-pane TUI
+
+A curses-based, split-pane file browser for transferring files between the
+local filesystem and agOO remote storage: queue-and-upload with a live
+progress bar, downloads, archive recall and cache eviction, all
+keyboard-driven.
+
+```bash
+python tools/filebrowser.py
+```
+
+See **[tools/README.md](tools/README.md)** for the complete illustrated
+manual (key bindings, file-state indicators, and screenshots).
+
+---
+
 ## Known limitations
 
 - `temp_get()` enforces a hard 10 MiB memory cap and will refuse to return
