@@ -1481,13 +1481,21 @@ class Agoo:
         )
 
     def schedule_unmigrate(self, f: str):
-        """Recall an archived file back to temp (cache) storage.
+        """Mark an archived file for recall back to temp (cache) storage.
 
         Uses a PATCH action query-parameter to request a server-side copy:
           PATCH /api/resources/<path>?action=copy&override=true&rename=false&...
 
-        rename=false means copy (archive copy is preserved); the file
-        will appear as isOffline=false once the recall job completes.
+        rename=false means copy (archive copy is preserved); after a
+        successful call the file will show unarchiveAsked=true in
+        list_resources() but will remain isOffline=true until the recall
+        job actually runs.
+
+        IMPORTANT: this call only schedules the recall.  You must call
+        async_synchronize() afterwards to trigger the server-side job that
+        physically moves the data.  Poll async_completed() to wait for
+        completion; the file becomes isOffline=false when done (typically
+        within a minute for small files).
 
         Returns the response object on success, None on failure.
         """
