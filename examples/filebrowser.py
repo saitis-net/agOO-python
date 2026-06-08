@@ -90,6 +90,11 @@ def _fmt_size(n: int) -> str:
 
 @dataclass
 class _LocalEntry:
+    """Immutable snapshot of one local filesystem entry used by LocalPane.
+
+    size is always 0 for directories; reading it with stat() would be
+    misleading because directory sizes are filesystem-dependent.
+    """
     path: Path
     name: str
     is_dir: bool
@@ -105,6 +110,7 @@ class LocalPane:
     """
 
     def __init__(self, win, start: Path) -> None:
+        """Initialise the pane and immediately populate entries via refresh()."""
         self.win = win
         self.path = start.resolve()
         self.entries: list[_LocalEntry] = []
@@ -114,6 +120,13 @@ class LocalPane:
         self.refresh()
 
     def refresh(self) -> None:
+        """Rebuild entries from the current directory.
+
+        Always prepends a synthetic ``..`` entry unless the path is the
+        filesystem root, so the user can navigate upward.  Entries are
+        sorted directories-first, then alphabetically by name (case-insensitive).
+        Hidden files (names starting with ``.``) are excluded.
+        """
         self.error = None
         items: list[_LocalEntry] = []
         if self.path != self.path.parent:
@@ -135,10 +148,12 @@ class LocalPane:
         self._clamp()
 
     def _clamp(self) -> None:
+        """Keep cursor inside the valid entry range after the list shrinks."""
         if self.cursor >= len(self.entries):
             self.cursor = max(0, len(self.entries) - 1)
 
     def _visible(self) -> int:
+        """Number of entry rows that fit inside the border (height − 2 border rows)."""
         return self.win.getmaxyx()[0] - 2
 
     def move_up(self) -> None:
@@ -262,6 +277,11 @@ class RemotePane:
     """
 
     def __init__(self, win, client: Agoo, pending_recalls: set[str]) -> None:
+        """Initialise the pane and immediately populate entries via refresh().
+
+        pending_recalls is stored by reference so that FileBrowser additions
+        are visible to draw() without an explicit synchronisation step.
+        """
         self.win = win
         self.client = client
         self.pending_recalls = pending_recalls
@@ -273,6 +293,11 @@ class RemotePane:
         self.refresh()
 
     def refresh(self) -> None:
+        """Fetch the current directory listing from the server.
+
+        On failure, entries is cleared so the pane shows the error message
+        rather than stale data from a previous successful listing.
+        """
         self.error = None
         raw = self.client.list_resources(self.remote_path)
         if raw is None:
@@ -282,12 +307,24 @@ class RemotePane:
         self._build(raw)
 
     def _build(self, items: list[dict]) -> None:
+        """Convert raw server items into the internal entry list.
+
+        Each entry is augmented with:
+          display_name  — the bare filename (same as ``name``)
+          api_path      — the server path with the leading ``/`` stripped,
+                          because all Agoo API calls use relative paths.
+
+        The internal sentinel directory ``_sgbdb`` is filtered out here so
+        it never appears in the pane.  Entries are sorted directories-first,
+        then alphabetically.  A synthetic ``..`` entry is prepended when not
+        at the root.
+        """
         result: list[dict] = []
         for item in items:
             name = item.get("name", "")
             if name in _HIDDEN_NAMES:
                 continue
-            api_path = item.get("path", "").lstrip("/")
+            api_path = item.get("path", "").lstrip("/")  # Agoo API uses relative paths
             result.append({**item, "display_name": name, "api_path": api_path})
 
         result.sort(key=lambda e: (not e.get("isDir", False),
@@ -303,10 +340,12 @@ class RemotePane:
         self._clamp()
 
     def _clamp(self) -> None:
+        """Keep cursor inside the valid entry range after the list shrinks."""
         if self.cursor >= len(self.entries):
             self.cursor = max(0, len(self.entries) - 1)
 
     def _visible(self) -> int:
+        """Number of entry rows that fit inside the border (height − 2 border rows)."""
         return self.win.getmaxyx()[0] - 2
 
     def move_up(self) -> None:
@@ -328,6 +367,12 @@ class RemotePane:
         return None
 
     def enter_dir(self) -> None:
+        """Navigate into the directory under the cursor.
+
+        For ``..``, rsplit strips the last path component; if the path
+        contains no ``/``, we are one level below root so the result is
+        ``""`` (root).
+        """
         e = self.current_entry()
         if not e or not e.get("isDir"):
             return
@@ -340,6 +385,7 @@ class RemotePane:
         self.refresh()
 
     def go_up(self) -> None:
+        """Navigate to the parent directory; no-op when already at root (empty path)."""
         if self.remote_path:
             self.remote_path = (self.remote_path.rsplit("/", 1)[0]
                                 if "/" in self.remote_path else "")
@@ -347,6 +393,17 @@ class RemotePane:
             self.refresh()
 
     def draw(self, active: bool, active_pair: int, italic_attr: int) -> None:
+        """Render the pane into its curses window.
+
+        Each entry is rendered with an indicator prefix that reflects the
+        server-reported file state:
+
+          ``  ``  directory (bold)
+          ``● ``  cached / online   — isOffline=false, unarchiveAsked=false  (bold)
+          ``✗ ``  eviction-marked   — isOffline=false, unarchiveAsked=true   (dim)
+          ``↑ ``  recall in progress — isOffline=true, unarchiveAsked=true   (italic)
+          ``○ ``  archived / offline  — isOffline=true, unarchiveAsked=false  (dim)
+        """
         win = self.win
         h, w = win.getmaxyx()
         win.erase()
@@ -489,6 +546,17 @@ class FileBrowser:
     """
 
     def __init__(self, stdscr, client: Agoo) -> None:
+        """Initialise colour pairs, state, and the two pane windows.
+
+        Colour pair assignments (referenced by number throughout the class):
+          1  cyan    — active pane title border
+          2  yellow  — status bar
+          3  green   — fully-queued local items ([+])
+          4  magenta — partially-queued local folders ([~])
+
+        A_ITALIC falls back to A_UNDERLINE on terminals that do not support it
+        (used for the ↑ recall-in-progress indicator in the remote pane).
+        """
         self.stdscr = stdscr
         self.client = client
         self.pending_recalls: set[str] = set()         # api_paths with active recall
@@ -503,9 +571,9 @@ class FileBrowser:
 
         curses.start_color()
         curses.use_default_colors()
-        curses.init_pair(1, curses.COLOR_CYAN,   -1)   # active pane title
-        curses.init_pair(2, curses.COLOR_YELLOW, -1)   # status bar
-        curses.init_pair(3, curses.COLOR_GREEN,  -1)   # fully-queued items
+        curses.init_pair(1, curses.COLOR_CYAN,    -1)  # active pane title
+        curses.init_pair(2, curses.COLOR_YELLOW,  -1)  # status bar
+        curses.init_pair(3, curses.COLOR_GREEN,   -1)  # fully-queued items
         curses.init_pair(4, curses.COLOR_MAGENTA, -1)  # partially-queued folders
 
         self._italic = getattr(curses, "A_ITALIC", curses.A_UNDERLINE)
@@ -545,6 +613,11 @@ class FileBrowser:
     # ── Drawing ────────────────────────────────────────────────────────────────
 
     def _draw_hints(self) -> None:
+        """Render the key-binding hint bar at the second-to-last row.
+
+        The 's' hint changes depending on which pane is active: upload queue
+        summary on the local pane, archive sync on the remote pane.
+        """
         h, w = self.stdscr.getmaxyx()
         n = len(self.pending_uploads)
         if self.active == 0:
@@ -559,6 +632,11 @@ class FileBrowser:
             pass
 
     def _draw_status(self) -> None:
+        """Render the status bar at the last row.
+
+        Shows ⟳ while a blocking operation is in progress (busy=True)
+        and ✓ when idle.
+        """
         h, w = self.stdscr.getmaxyx()
         icon = " ⟳ " if self.busy else " ✓ "
         line = (icon + self.status)[:w - 1].ljust(w - 1)
@@ -569,6 +647,11 @@ class FileBrowser:
         self.stdscr.noutrefresh()
 
     def _draw_all(self) -> None:
+        """Full repaint: hints bar → status bar → both panes → overlay (if active).
+
+        The upload overlay is drawn last so it paints on top of both pane
+        windows in the curses virtual screen.
+        """
         self.stdscr.erase()
         self._draw_hints()
         self._draw_status()
@@ -580,6 +663,11 @@ class FileBrowser:
         curses.doupdate()
 
     def _set_status(self, msg: str, busy: bool = False) -> None:
+        """Update status text and busy flag, then immediately repaint the status bar.
+
+        Calls doupdate() directly rather than waiting for the next _draw_all()
+        so the user sees the update as soon as the operation starts.
+        """
         self.status = msg
         self.busy   = busy
         self._draw_status()
@@ -786,11 +874,18 @@ class FileBrowser:
                     self._trigger_sync()
 
     def _active_pane(self):
+        """Return the pane currently in focus (active=0 → local, active=1 → remote)."""
         return self._local_pane if self.active == 0 else self._remote_pane
 
     # ── Space key — toggle upload queue ───────────────────────────────────────
 
     def _handle_space(self) -> None:
+        """Toggle the upload queue for the file under the cursor.
+
+        Only applies to the local pane.  Directories are silently ignored
+        because only individual files can be queued via Space; use Enter →
+        "Mark folder for upload" to queue an entire directory tree.
+        """
         if self.active != 0:
             return
         e = self._local_pane.current_entry()
@@ -810,12 +905,24 @@ class FileBrowser:
     # ── Enter key ──────────────────────────────────────────────────────────────
 
     def _handle_enter(self) -> None:
+        """Dispatch Enter to the active pane handler.
+
+        The two handlers are separate because the menus and underlying
+        operations differ completely between local and remote contexts.
+        """
         if self.active == 0:
             self._handle_local_enter()
         else:
             self._handle_remote_enter()
 
     def _handle_local_enter(self) -> None:
+        """Handle Enter on the local pane.
+
+        Three cases:
+          ``..``      → navigate up directly (no menu).
+          directory   → Browse / Mark folder for upload / Cancel menu.
+          file        → Mark for upload / Unmark / Cancel menu.
+        """
         pane = self._local_pane
         e    = pane.current_entry()
         if e is None:
@@ -856,6 +963,15 @@ class FileBrowser:
             self._draw_all()
 
     def _handle_remote_enter(self) -> None:
+        """Handle Enter on the remote pane.
+
+        For directories: Browse / Download folder / Mark for retrieval menu.
+        For files, the menu depends on the file's state:
+          ● cached, unarchiveAsked=false  → Download / Mark for retrieval / Delete
+          ✗ cached, unarchiveAsked=true   → Download / Unmark (return to archive) / Delete
+          ↑ offline + recall in progress  → info popup only
+          ○ archived (offline)            → Retrieve from archive
+        """
         pane = self._remote_pane
         e    = pane.current_entry()
         if e is None:
@@ -1110,7 +1226,14 @@ class FileBrowser:
             self._set_status(f"Delete failed: {self.client.error()}")
 
     def _trigger_sync(self) -> None:
-        """Trigger an agOO archive sync from the remote pane ('s' key)."""
+        """Trigger an agOO archive sync from the remote pane ('s' key).
+
+        Runs in a background daemon thread so the UI stays responsive.
+        The job is polled every 30 seconds (hardcoded; sync jobs are slow
+        by nature — archiving to tape may take minutes).  Progress is
+        reported via recall_status/recall_done/recall_error messages on
+        msg_q, which the event loop displays in the status bar.
+        """
         def _work() -> None:
             self.msg_q.put(("recall_status", "Triggering archive sync…"))
             job_id = self.client.async_synchronize()
@@ -1220,6 +1343,13 @@ class FileBrowser:
 # ── Entry point ────────────────────────────────────────────────────────────────
 
 def main() -> None:
+    """Entry point: authenticate and launch the curses TUI.
+
+    curses.wrapper() is used so the terminal is restored to a sane state
+    even if FileBrowser.run() raises an exception.  The ``finally`` block
+    calls logout() to discard the session token regardless of how the
+    application exits.
+    """
     missing = [n for n, v in (("agOO_USER", _USER), ("agOO_PASSWORD", _PASSWORD)) if not v]
     if missing:
         for n in missing:

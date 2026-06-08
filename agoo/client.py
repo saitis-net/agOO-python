@@ -83,10 +83,12 @@ class _SafeSession(requests.Session):
     """
 
     def __init__(self) -> None:
+        """Replace the default cookie jar with an empty, non-accumulating one."""
         super().__init__()
         self.cookies = requests.cookies.RequestsCookieJar()  # reject all server cookies
 
     def rebuild_auth(self, prepared_request, response) -> None:
+        """Drop X-Auth when a redirect crosses to a different host."""
         super().rebuild_auth(prepared_request, response)
         if urlparse(response.url).netloc != urlparse(prepared_request.url).netloc:
             prepared_request.headers.pop("X-Auth", None)
@@ -327,6 +329,7 @@ class Agoo:
     # -------------------------------------------------------------------
 
     def _get(self, path: str, **headers):
+        """Thin wrapper around _do(); see _do() for retry and auth behaviour."""
         return self._do("GET", path, **headers)
 
     def _get_stream(self, path: str, **headers):
@@ -343,12 +346,15 @@ class Agoo:
         return self._do("GET", path, stream=True, **headers)
 
     def _post(self, path: str, body=None, **headers):
+        """Thin wrapper around _do(); see _do() for retry and auth behaviour."""
         return self._do("POST", path, body=body, **headers)
 
     def _patch(self, path: str, body=None, **headers):
+        """Thin wrapper around _do(); see _do() for retry and auth behaviour."""
         return self._do("PATCH", path, body=body, **headers)
 
     def _delete(self, path: str, **headers):
+        """Thin wrapper around _do(); see _do() for retry and auth behaviour."""
         return self._do("DELETE", path, **headers)
 
     def _tus_get_offset(self, tus_path: str) -> int | None:
@@ -571,6 +577,7 @@ class Agoo:
         self._auth_token = None
 
     def __del__(self) -> None:
+        """Clear the auth token when the object is garbage-collected (mirrors logout())."""
         self._auth_token = None
 
     # -------------------------------------------------------------------
@@ -1452,8 +1459,9 @@ class Agoo:
         return True
 
     def temp_del(self, f: str):
-        """Delete a file from temp storage.
+        """Delete a file from temp (cache) storage.
 
+        Removes the cached copy only; any archive copy is unaffected.
         Returns the response object on success, None on failure.
         """
         return self._delete("api/resources/" + uri_escape(f))
@@ -1463,14 +1471,15 @@ class Agoo:
     # -------------------------------------------------------------------
 
     def schedule_migrate(self, f: str):
-        """Move a cached file back to archive storage (evict from cache).
+        """Evict a cached file back to archive storage (rename=true → MOVE).
 
         Uses the same PATCH endpoint as schedule_unmigrate() but with
         rename=true, which tells the server to move rather than copy:
           PATCH /api/resources/<path>?action=copy&override=true&rename=true&...
 
-        After this call the file will appear as isOffline=true in
-        list_resources() and can be recalled with schedule_unmigrate().
+        The cached copy is removed; the archive copy is preserved.  After
+        this call the file will appear as isOffline=true, unarchiveAsked=false
+        in list_resources() and can be recalled with schedule_unmigrate().
 
         Returns the response object on success, None on failure.
         """
@@ -1481,21 +1490,23 @@ class Agoo:
         )
 
     def schedule_unmigrate(self, f: str):
-        """Mark an archived file for recall back to temp (cache) storage.
+        """Set unarchiveAsked=true on a file (rename=false → COPY, archive kept).
 
-        Uses a PATCH action query-parameter to request a server-side copy:
+        Uses a PATCH action query-parameter:
           PATCH /api/resources/<path>?action=copy&override=true&rename=false&...
 
-        rename=false means copy (archive copy is preserved); after a
-        successful call the file will show unarchiveAsked=true in
-        list_resources() but will remain isOffline=true until the recall
-        job actually runs.
+        Dual behaviour depending on the current file state:
+          isOffline=true  (archived)  → schedules a recall to cache.
+                                        File shows as ↑ in the TUI until the
+                                        job completes (isOffline becomes false).
+          isOffline=false (cached)    → marks the file with unarchiveAsked=true
+                                        without moving it.  File shows as ✗ in
+                                        the TUI.
 
-        IMPORTANT: this call only schedules the recall.  You must call
-        async_synchronize() afterwards to trigger the server-side job that
-        physically moves the data.  Poll async_completed() to wait for
-        completion; the file becomes isOffline=false when done (typically
-        within a minute for small files).
+        IMPORTANT: this call only sets the flag.  Call async_synchronize()
+        afterwards to trigger the server-side job.  Poll async_completed() to
+        wait for completion; the file becomes isOffline=false when done
+        (typically within a minute for small files).
 
         Returns the response object on success, None on failure.
         """
