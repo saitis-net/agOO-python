@@ -1,0 +1,122 @@
+@startuml agoo_architecture
+' Component / architecture diagram for the agoo client.
+' Render with: plantuml docs/uml/02_architecture.puml
+
+!theme plain
+skinparam componentStyle rectangle
+skinparam linetype ortho
+
+actor "Caller\n(script / TUI)" as caller
+
+rectangle "agoo Python library" {
+
+  rectangle "Security layer" as sec {
+    component "_validate_local_path()\n_validate_output_path()\n_safe_local_dest()" as valid #LightYellow
+    note right of valid
+      • Rejects null bytes
+      • Rejects relative path traversal
+      • Enforces HTTPS-only URLs
+    end note
+  }
+
+  rectangle "HTTP layer" as httplayer {
+    component "_SafeSession\n(requests.Session)" as sess #LightBlue
+    component "_do()\n4-attempt retry loop\n502 → wake + re-login" as do_comp #LightBlue
+    component "TUS protocol\n_tus_get_offset()\ntemp_put()" as tus_comp #LightBlue
+  }
+
+  rectangle "API methods" as api_methods {
+    component "Auth\nlogin() / logout()" as auth_comp #PaleGreen
+    component "Listing & metadata\nstat() / list_resources()\nget_usage() / temp_sum()" as list_comp #PaleGreen
+    component "Upload\ntemp_put() / temp_put_fake()\nbatch_put()" as upload_comp #PaleGreen
+    component "Download\ntemp_get() / temp_get_file()" as download_comp #PaleGreen
+    component "Delete\ntemp_del()" as delete_comp #PaleGreen
+    component "Archive ops\nschedule_migrate()\nschedule_unmigrate()" as archive_comp #PaleGreen
+    component "Async jobs\nasync_synchronize()\nasync_completed()\nterminate()" as async_comp #PaleGreen
+  }
+
+}
+
+rectangle "agOO server (HTTPS)" {
+
+  rectangle "REST API endpoints" as rest {
+    component "POST   api/login" as ep_login
+    component "GET    api/usage" as ep_usage
+    component "GET    api/resources/<path>" as ep_res_get
+    component "DELETE api/resources/<path>" as ep_res_del
+    component "PATCH  api/resources/<path>?action=copy" as ep_res_patch
+    component "GET    api/raw/<path>" as ep_raw
+    component "POST   api/tus/<path>" as ep_tus_post
+    component "PATCH  api/tus/<path>" as ep_tus_patch
+    component "HEAD   api/tus/<path>" as ep_tus_head
+    component "POST   api/terminate" as ep_term
+  }
+
+  database "Temp storage\n(cache, online)" as temp #LightSalmon
+  database "Archive storage\n(tape / offline)" as archive #LightGray
+
+  component "Async migration job\n(background process)" as migrator
+
+}
+
+component "start_url\n(wake-up CGI)" as startup #LightYellow
+
+' Caller → library
+caller --> auth_comp
+caller --> list_comp
+caller --> upload_comp
+caller --> download_comp
+caller --> archive_comp
+caller --> async_comp
+
+' Methods → HTTP layer
+auth_comp    --> do_comp
+list_comp    --> do_comp
+upload_comp  --> do_comp
+upload_comp  --> tus_comp
+download_comp --> do_comp
+delete_comp  --> do_comp
+archive_comp --> do_comp
+async_comp   --> do_comp
+
+valid --> tus_comp : guards
+valid --> upload_comp : guards
+valid --> download_comp : guards
+
+do_comp --> sess
+sess    --> rest : HTTPS\nX-Auth header
+
+' 502 wake-up path
+do_comp --> startup : GET (on 502)
+
+' REST → storage
+ep_login     --> temp : creates session token
+ep_tus_post  --> temp : allocate upload slot
+ep_tus_patch --> temp : write file data
+ep_tus_head  --> temp : query offset
+ep_res_get   --> temp : read metadata / listing
+ep_res_del   --> temp : delete cached copy
+ep_raw       --> temp : stream file content
+ep_usage     --> temp : read capacity stats
+ep_usage     --> archive : read capacity stats
+ep_res_patch --> migrator : enqueue recall job
+ep_term      --> temp : shutdown signal
+
+' Async sync loop: batch_put uploads a sentinel file to trigger archival
+upload_comp  ..> migrator : sentinel upload\n(_sgbdb/archUnarchAsked)\ntriggers archival
+migrator     --> archive : archive / recall files
+async_comp   ..> temp : poll finished.<id>\n(async_completed)
+
+note bottom of temp
+  Files here are isOffline = false.
+  Accessible via api/raw/ for download.
+  Subject to capacity limits (get_usage).
+end note
+
+note bottom of archive
+  Files here are isOffline = true.
+  Returned to temp via schedule_unmigrate()
+  which triggers an async recall job.
+end note
+
+@enduml

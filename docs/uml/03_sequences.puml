@@ -1,0 +1,206 @@
+@startuml agoo_sequences
+' Sequence diagrams for the four key operation flows.
+' Render with: plantuml docs/uml/03_sequences.puml
+
+!theme plain
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+skinparam maxMessageSize 120
+
+' ═══════════════════════════════════════════════════════════════
+' 1. Authentication + 502 wake-up
+' ═══════════════════════════════════════════════════════════════
+
+newpage Authentication & 502 wake-up retry
+
+participant "Caller" as caller
+participant "Agoo\nlogin()" as agoo
+participant "_do()\n4-attempt loop" as do
+participant "agOO server" as server
+participant "start_url\n(wake CGI)" as wake
+
+caller -> agoo : login()
+agoo -> do : POST api/login\n{username, password}
+do -> server : HTTPS POST
+
+alt server is running
+  server --> do : 200 + token
+  do --> agoo : response
+  agoo -> agoo : _auth_token = token
+  agoo --> caller : True
+
+else server returned 502 (stopped)
+  server --> do : 502 Bad Gateway
+  do -> wake : GET start_url
+  wake --> do : 200 OK
+  do -> do : sleep 5 s
+  do -> server : HTTPS POST (retry, attempt 2)
+  server --> do : 200 + token
+  do --> agoo : response
+  agoo -> agoo : _auth_token = token
+  agoo --> caller : True
+
+else all 4 attempts exhausted
+  do --> agoo : None
+  agoo --> caller : False\nerror() = "starting instance did not work"
+end
+
+
+' ═══════════════════════════════════════════════════════════════
+' 2. Single file upload — TUS protocol
+' ═══════════════════════════════════════════════════════════════
+
+newpage Single-file upload: TUS resumable protocol (temp_put)
+
+participant "Caller" as caller
+participant "Agoo\ntemp_put()" as tp
+participant "agOO server" as server
+
+caller -> tp : temp_put("file.tar.gz", override=False)
+tp -> tp : _validate_local_path()
+tp -> server : GET api/usage
+server --> tp : {total, used}
+tp -> tp : check file fits\nwithin available cache
+
+tp -> server : HEAD api/tus/file.tar.gz\n(Tus-Resumable: 1.0.0)
+
+alt no existing upload slot
+  server --> tp : 404
+  tp -> server : POST api/tus/file.tar.gz?override=false\n(Upload-Length: N)
+  server --> tp : 200 OK
+  tp -> tp : offset = 0
+
+else partial upload exists
+  server --> tp : 200\n(Upload-Offset: K)
+  tp -> tp : offset = K\n(resume from byte K)
+
+else file already fully uploaded
+  server --> tp : 200\n(Upload-Offset = file_size)
+  tp --> caller : True (already complete)
+end
+
+loop send chunks until EOF
+  tp -> server : PATCH api/tus/file.tar.gz\n(Upload-Offset: offset,\n Content-Type: application/offset+octet-stream,\n body: chunk[offset..offset+io_size])
+  server --> tp : 204 No Content
+
+  alt PATCH failed (network error)
+    tp -> server : HEAD api/tus/file.tar.gz
+    server --> tp : Upload-Offset (server's actual position)
+    tp -> tp : resume from\nserver offset\n(up to 5 times)
+  end
+
+  tp -> tp : offset += len(chunk)
+end
+
+tp --> caller : True
+
+
+' ═══════════════════════════════════════════════════════════════
+' 3. Batch upload with automatic sync
+' ═══════════════════════════════════════════════════════════════
+
+newpage Batch upload with cache management (batch_put)
+
+participant "Caller" as caller
+participant "Agoo\nbatch_put()" as bp
+participant "Agoo\ntemp_put()" as tp
+participant "agOO server" as server
+participant "progress\ncallback" as prog
+participant "abort_event\n(threading.Event)" as abort
+
+caller -> bp : batch_put([f1,f2,f3,...],\n  progress=cb, abort_event=ev)
+
+bp -> bp : Phase 1: validate all paths\n& stat all file sizes
+
+bp -> server : GET api/usage
+server --> bp : {total, used}
+bp -> bp : Phase 2: verify each file ≤\ntotal × 0.9 (hard cap check)
+
+loop while pending files remain
+
+  bp -> server : GET api/usage
+  server --> bp : {total, used}
+  bp -> bp : available = max(0, total×0.9 − used)\nbuild batch: greedily add files\nthat fit in available
+
+  loop for each file in batch
+    bp -> abort : is_set()?
+    abort --> bp : False (continue)
+
+    bp -> tp : temp_put(f, override)
+
+    note over tp,server
+      Full TUS upload sequence
+      (see previous diagram)
+    end note
+
+    tp --> bp : True
+
+    bp -> bp : files_done++\nbytes_done += size
+    bp -> prog : progress(f, files_done,\ntotal_files, bytes_done, total_bytes)
+    prog --> bp : (returns)
+
+    bp -> abort : is_set()?
+
+    alt abort was set (Ctrl-C)
+      abort --> bp : True
+      bp -> bp : _error = "upload aborted by user"
+      bp --> caller : None
+    end
+
+    bp -> server : GET api/usage
+    server --> bp : {total, used}\n(refresh for next file —\naccounts for concurrent uploads)
+  end
+
+  ' Trigger archival sync after every batch
+  bp -> server : temp_put_fake(\n  _sgbdb/archUnarchAsked\n)\n→ sentinel upload triggers server-side migration job
+  server --> bp : job_id (from filename)
+
+  loop poll until job complete (every poll_interval seconds)
+    bp -> server : GET api/resources/\n  _sgbdb/finished.<job_id>
+    alt job still running
+      server --> bp : 404 Not Found
+      bp -> bp : sleep(poll_interval)
+    else job completed
+      server --> bp : 200 OK  {status: 0}
+      bp -> bp : break — cache reclaimed
+    end
+  end
+
+end
+
+bp --> caller : True
+
+
+' ═══════════════════════════════════════════════════════════════
+' 4. Archive recall
+' ═══════════════════════════════════════════════════════════════
+
+newpage Archive recall (schedule_unmigrate)
+
+participant "Caller" as caller
+participant "Agoo" as agoo
+participant "agOO server" as server
+
+caller -> agoo : schedule_unmigrate("eos/image.swi")
+agoo -> server : PATCH api/resources/eos/image.swi\n  ?action=copy\n  &override=true\n  &rename=false\n  &destination=/eos/image.swi
+
+note right of server
+  Server queues an async copy job:
+  archive → temp (cache).
+  The file appears as isOffline=true
+  with unarchiveAsked=true until the
+  job completes.
+end note
+
+server --> agoo : 200 OK
+agoo --> caller : response (truthy)
+
+caller -> caller : poll list_resources() until\nisOffline=false\n(file is back in cache)
+
+caller -> agoo : temp_get_file("eos/image.swi", "/local/image.swi")
+agoo -> server : GET api/raw/eos/image.swi\n(stream=True)
+server --> agoo : 200 + file stream
+agoo -> agoo : write chunks to disk
+agoo --> caller : True
+
+@enduml
