@@ -1065,8 +1065,8 @@ class FileBrowser:
     # ── Operations ─────────────────────────────────────────────────────────────
 
     def _do_unmark(self, api_path: str, display: str) -> None:
-        """Return a cached file to archive via schedule_unmigrate."""
-        ok = self.client.schedule_unmigrate(api_path)
+        """Return a cached file to archive via schedule_migrate."""
+        ok = self.client.schedule_migrate(api_path)
         if ok:
             self._set_status(f"Unmarked: {display}  (returned to archive).")
             self._remote_pane.refresh()
