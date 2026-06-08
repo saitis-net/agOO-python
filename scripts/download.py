@@ -11,10 +11,15 @@ archive and a 1 KB text file consume the same peak memory.
 Archive recall
 --------------
 Files that have been migrated to tape archive are not directly downloadable
-via the temp API.  Pass --wait to trigger an automatic recall: the script
-calls schedule_unmigrate(), then polls until the file comes back online and
-the download can proceed.  Use --poll-interval and --timeout to tune the
-polling cadence and maximum wait time.
+via the temp API.  Pass --wait to trigger an automatic recall:
+
+  1. schedule_unmigrate() marks the file for recall (sets unarchiveAsked).
+  2. async_synchronize()  triggers the server-side recall job.
+  3. async_completed()    is polled until the job finishes.
+  4. The download then proceeds as normal.
+
+Use --poll-interval and --timeout to tune the polling cadence and maximum
+wait time.
 
 Usage
 -----
@@ -253,20 +258,28 @@ def main() -> int:
             #       also fail in this case, so we surface that error instead.
             # ---------------------------------------------------------------
             print("Download returned 404 — requesting archive recall…")
+
+            # Step 1: mark the file for recall.
             if client.schedule_unmigrate(args.remote_path) is None:
-                # Unmigrate failed: the file is most likely not on the server.
                 print(
                     f"Recall failed (file may not exist): {client.error()}",
                     file=sys.stderr,
                 )
                 return 1
 
-            # Recall was accepted.  Poll until the file comes back online,
-            # retrying the full download on each tick rather than just
-            # checking status — this avoids a separate stat/listing call and
-            # means the download starts the moment the file is available.
+            # Step 2: trigger the server-side recall job via async_synchronize().
+            # Without this call schedule_unmigrate() only sets the flag;
+            # the actual data movement never starts.
+            print("Triggering archive sync to start recall…")
+            job_id = client.async_synchronize()
+            if job_id is None:
+                print(f"Sync trigger failed: {client.error()}", file=sys.stderr)
+                return 1
+
+            # Step 3: poll async_completed() until the recall job finishes.
             print(
-                f"Recall queued. Polling every {args.poll_interval}s "
+                f"Recall job queued ({job_id[:12]}…). "
+                f"Polling every {args.poll_interval}s "
                 f"(timeout: {args.timeout}s, Ctrl-C to abort)…"
             )
             deadline = time.monotonic() + args.timeout
@@ -274,26 +287,39 @@ def main() -> int:
             while time.monotonic() < deadline:
                 time.sleep(args.poll_interval)
 
-                ok = client.temp_get_file(
-                    args.remote_path,
-                    local_path,
-                    chunk_size=args.chunk_size,
-                )
-
-                if ok:
-                    # File came online and the download completed.
-                    break
-
-                # Still not available — clean up the partial file written
-                # during this attempt and report progress to the operator.
-                _cleanup(local_path)
+                status = client.async_completed(job_id)
                 remaining = int(deadline - time.monotonic())
-                print(f"  Still recalling… ({remaining}s remaining)", flush=True)
+
+                if status is None:
+                    print(f"  Still recalling… ({remaining}s remaining)", flush=True)
+                    continue
+
+                if status != 0:
+                    print(
+                        f"Recall job finished with non-zero status {status}.",
+                        file=sys.stderr,
+                    )
+                    return 1
+
+                # Job completed — proceed to download.
+                print("Recall complete. Downloading…")
+                break
             else:
                 print(
                     f"Timed out after {args.timeout}s waiting for archive recall.",
                     file=sys.stderr,
                 )
+                return 1
+
+            # Step 4: download now that the file is back in cache.
+            ok = client.temp_get_file(
+                args.remote_path,
+                local_path,
+                chunk_size=args.chunk_size,
+            )
+            if not ok:
+                _cleanup(local_path)
+                print(f"Download failed after recall: {client.error()}", file=sys.stderr)
                 return 1
 
         # Report the final size as a sanity check for the operator.
