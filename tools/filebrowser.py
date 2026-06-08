@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""examples/filebrowser.py — Interactive split-pane TUI for agOO storage.
+"""tools/filebrowser.py — Interactive split-pane TUI for agOO storage.
 
 Layout
 ------
