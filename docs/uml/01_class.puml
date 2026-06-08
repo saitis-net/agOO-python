@@ -60,7 +60,7 @@ package "agoo" {
     .. Download (temp/cache) ..
     + temp_get(f) : bytes | None
     + temp_get_file(f, output_path) : bool | None
-    .. Delete ..
+    .. Delete (cache only — archive unaffected) ..
     + temp_del(f)
     .. Archive operations (scheduled) ..
     + schedule_migrate(f)
@@ -78,10 +78,10 @@ Agoo *-- SafeSession : _session
 
 note right of SafeSession
   Security hardening on top of requests.Session:
-  • rebuild_auth() drops the X-Auth token when
-    a redirect crosses to a different host.
-  • cookies is a blank, non-accumulating jar so
-    server-set cookies are never replayed.
+  • __init__() replaces the cookie jar with an empty
+    non-accumulating one (server cookies rejected).
+  • rebuild_auth() drops X-Auth when a redirect
+    crosses to a different host.
 end note
 
 note bottom of Agoo
@@ -103,16 +103,22 @@ note right of Agoo
   debug      True → print diagnostics to stderr
   io_size    TUS chunk size in bytes (default 10 MiB)
 
-  Archive operations (same endpoint, different rename= flag)
-  ──────────────────────────────────────────────────────────
-  schedule_migrate(f)    rename=true  → evict cache, keep archive
-                         → file becomes isOffline=true
-  schedule_unmigrate(f)  rename=false → mark for recall / mark for eviction
-                         → sets unarchiveAsked=true
-                         → caller must call async_synchronize() to trigger
-  Note: on a cached file (isOffline=false), schedule_unmigrate sets
-  unarchiveAsked=true without moving the file (shown as ✗ in TUI).
-  On an archived file (isOffline=true), it schedules a recall (shown as ↑).
+  Archive operations — same PATCH endpoint, different rename= flag
+  ────────────────────────────────────────────────────────────────
+  schedule_migrate(f)
+    rename=true → MOVE: cached copy evicted, archive preserved.
+    Result: isOffline=true, unarchiveAsked=false.
+
+  schedule_unmigrate(f)
+    rename=false → COPY: sets unarchiveAsked=true.
+    Dual role depending on current file state:
+      isOffline=true  (archived) → schedules recall (file shows ↑)
+      isOffline=false (cached)   → marks for eviction (file shows ✗)
+    Caller must call async_synchronize() to trigger the server job.
+
+  temp_del(f)
+    Removes the cached copy only; archive copy is NOT affected.
+    Use schedule_migrate() to return a file to archive while keeping it.
 end note
 
 @enduml

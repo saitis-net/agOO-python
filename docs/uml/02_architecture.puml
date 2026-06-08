@@ -95,12 +95,12 @@ ep_tus_post  --> temp : allocate upload slot
 ep_tus_patch --> temp : write file data
 ep_tus_head  --> temp : query offset
 ep_res_get   --> temp : read metadata / listing
-ep_res_del   --> temp : delete cached copy
+ep_res_del   --> temp : delete cached copy\n(archive unaffected)
 ep_raw       --> temp : stream file content
 ep_usage     --> temp : read capacity stats
 ep_usage     --> archive : read capacity stats
-ep_res_patch_migrate   --> temp    : evict cached copy\n(move to archive)
-ep_res_patch_unmigrate --> migrator : enqueue recall job\n(async_synchronize triggers it)
+ep_res_patch_migrate   --> temp    : evict cached copy\n(rename=true → MOVE to archive)
+ep_res_patch_unmigrate --> migrator : set unarchiveAsked=true\nif archived → recall (↑)\nif cached   → mark eviction (✗)\nasync_synchronize() triggers job
 ep_term      --> temp : shutdown signal
 
 ' Async sync loop: batch_put uploads a sentinel file to trigger archival
