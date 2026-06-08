@@ -27,6 +27,7 @@ Local pane
 Remote pane
 -----------
   Bold   ● file is in temp (cache) — available for Download.
+  Dim    ✗ file is in cache but marked for eviction (unarchiveAsked).
   Dim    ○ file is in archive — available for Retrieve.
   Italic ↑ archive recall in progress.
 
@@ -381,8 +382,9 @@ class RemotePane:
             is_offline = e.get("isOffline", False)
             api_path   = e.get("api_path", "")
             display    = e.get("display_name", e.get("name", ""))
-            pending    = is_offline and (e.get("unarchiveAsked", False)
-                                         or api_path in self.pending_recalls)
+            pending   = is_offline and (e.get("unarchiveAsked", False)
+                                        or api_path in self.pending_recalls)
+            evicting  = (not is_offline) and e.get("unarchiveAsked", False)
 
             if is_dir:
                 indicator = "  "
@@ -392,6 +394,10 @@ class RemotePane:
                 indicator = "↑ "
                 label     = display
                 attr      = italic_attr
+            elif evicting:
+                indicator = "✗ "
+                label     = display
+                attr      = curses.A_DIM
             elif not is_offline:
                 indicator = "● "
                 label     = display
