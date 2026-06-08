@@ -2,7 +2,6 @@
 ' Sequence diagrams for the four key operation flows.
 ' Render with: plantuml docs/uml/03_sequences.puml
 
-!theme plain
 skinparam sequenceMessageAlign center
 skinparam responseMessageBelowArrow true
 skinparam maxMessageSize 120

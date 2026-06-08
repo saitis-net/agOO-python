@@ -2,7 +2,6 @@
 ' Class diagram for the agoo Python client library.
 ' Render with: plantuml docs/uml/01_class.puml
 
-!theme plain
 skinparam classAttributeIconSize 0
 skinparam classFontSize 12
 skinparam packageFontSize 13

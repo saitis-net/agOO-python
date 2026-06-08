@@ -2,7 +2,6 @@
 ' Component / architecture diagram for the agoo client.
 ' Render with: plantuml docs/uml/02_architecture.puml
 
-!theme plain
 skinparam componentStyle rectangle
 skinparam linetype ortho
 
