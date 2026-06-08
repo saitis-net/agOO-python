@@ -963,7 +963,9 @@ class Agoo:
         return True
 
     def batch_put(self, files: list[str], poll_interval: int = 30,
-                  override: bool = False) -> bool | None:
+                  override: bool = False,
+                  progress=None,
+                  abort_event=None) -> bool | None:
         """Upload a list of local files, automatically batching and syncing.
 
         Use this method when the combined size of all files may exceed the
@@ -1005,6 +1007,14 @@ class Agoo:
         override      : passed through to temp_put() for each file; if True,
                         existing copies on the server are replaced rather than
                         skipped (default False).
+        progress      : optional callable invoked after each successful upload.
+                        Signature: progress(path, files_done, files_total,
+                                            bytes_done, bytes_total).
+                        Called from the same thread as batch_put(); must be
+                        non-blocking.
+        abort_event   : optional threading.Event; when set, the upload loop
+                        stops cleanly after the current file and returns None
+                        with self.error() set to "upload aborted by user".
 
         Returns
         -------
@@ -1082,6 +1092,11 @@ class Agoo:
         # `pending` holds the files not yet uploaded, in original order.
         # Each iteration of the while-loop processes one batch.
         # ------------------------------------------------------------------
+        total_files = len(file_entries)
+        total_bytes = sum(size for _, size in file_entries)
+        files_done  = 0
+        bytes_done  = 0
+
         pending = list(file_entries)   # mutable working copy
         batch_number = 0
 
@@ -1165,6 +1180,9 @@ class Agoo:
             # above and the actual upload of each file.
             # ---------------------------------------------------------------
             for f, size in current_batch:
+                if abort_event is not None and abort_event.is_set():
+                    self._error = "upload aborted by user"
+                    return None
                 self._debug(
                     f"batch_put: [{batch_number}] uploading '{f}' ({size:,} bytes)…"
                 )
@@ -1172,6 +1190,13 @@ class Agoo:
                     # temp_put() already populated self._error.
                     return None
                 self._debug(f"batch_put: [{batch_number}] '{f}' uploaded OK")
+                files_done += 1
+                bytes_done += size
+                if progress is not None:
+                    progress(f, files_done, total_files, bytes_done, total_bytes)
+                if abort_event is not None and abort_event.is_set():
+                    self._error = "upload aborted by user"
+                    return None
                 # Refresh usage after each upload so that space consumed by
                 # other concurrent clients is reflected before the next file.
                 usage = self.get_usage()

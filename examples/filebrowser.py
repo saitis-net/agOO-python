@@ -6,33 +6,49 @@ Layout
   ┌ Local: /home/user ──────────┬ Remote: /eos ────────────────┐
   │ ..                          │ ..                           │
   │ dir/                  4 KB  │   dir/                       │
-  │ file.tar.gz         1.2 GB  │ ● online.gz        3.4 GB   │ ← bold
-  │ [+] queued.gz     512.0 MB  │ ○ archived.gz      5.6 GB   │ ← dim
-  │                             │ ↑ recalled.gz      7.8 GB   │ ← italic
+  │ [+] queued.gz     512.0 MB  │ ● online.gz        3.4 GB   │ ← bold
+  │ [~] partial/              0 │ ○ archived.gz      5.6 GB   │ ← dim
+  │ file.tar.gz         1.2 GB  │ ↑ recalled.gz      7.8 GB   │ ← italic
   └─────────────────────────────┴──────────────────────────────┘
-   Tab:switch  ↑↓/jk:move  Space:mark  Enter:menu  r:refresh  ⌫:up
-   s:upload N pending  q:quit
+   Tab:switch  ↑↓/jk:move  Space:mark  u:unmark all
+   Enter:menu  r:refresh  ⌫:up  s:upload N pending  q:quit
    ✓ Ready
 
 Local pane
 ----------
-  [+] green   File is queued for upload (press 's' to start)
-  Space       Toggle upload queue for the file under the cursor
-  Enter       On a file   → Mark / Unmark for upload
-              On a folder → Browse  or  Mark folder for upload
+  [+] green    File (or fully-queued folder) — queued for upload.
+  [~] magenta  Folder with some but not all files queued.
+  Space        Toggle upload queue for the file under the cursor.
+  Enter        On a file   → Mark / Unmark for upload.
+               On a folder → Browse  or  Mark all files for upload.
+  s            Upload all queued files.  Shows a progress overlay;
+               press Ctrl-C to abort after the current file finishes.
 
 Remote pane
 -----------
-  Bold   ● file is in temp (cache) — available for Download
-  Dim    ○ file is in archive — available for Retrieve
-  Italic ↑ archive recall in progress
+  Bold   ● file is in temp (cache) — available for Download.
+  Dim    ○ file is in archive — available for Retrieve.
+  Italic ↑ archive recall in progress.
 
-  Enter  On a file (cache)   → Download to local
-         On a file (archive) → Retrieve from archive (recall + download)
-         On a file (pending) → status info only
-         On a folder         → Browse  or  Mark folder for retrieval
+  Enter  On a file (cache)   → Download / Unmark (return to archive) / Delete.
+         On a file (archive) → Retrieve from archive (triggers recall).
+         On a file (pending) → status info only.
+         On a folder         → Browse / Download folder / Mark for retrieval.
+  s      Trigger an archive sync (non-blocking, status shown in footer).
 
-  s      (local pane only) Upload all queued files
+Threading model
+---------------
+  The main thread owns curses and drains msg_q on every loop tick.
+  Worker threads (uploads, downloads, recalls, sync) communicate back
+  exclusively through msg_q using the following message kinds:
+
+    upload_progress  dict with file/done/total/bytes_done/bytes_total
+    status           str — busy status-bar update (blocking op in progress)
+    done             str — blocking op succeeded
+    error            str — blocking op failed
+    recall_done      str — background recall/download succeeded
+    recall_status    str — background recall progress note
+    recall_error     str — background recall/download failed
 
 Credentials
 -----------
@@ -47,6 +63,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from agoo import Agoo
@@ -61,6 +78,7 @@ _HIDDEN_NAMES = {"_sgbdb"}
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
 def _fmt_size(n: int) -> str:
+    """Format *n* bytes as a human-readable string (e.g. '1.2 GB', '512.0 MB')."""
     for unit, thr in (("GB", 1 << 30), ("MB", 1 << 20), ("KB", 1 << 10)):
         if n >= thr:
             return f"{n / thr:.1f} {unit}"
@@ -78,7 +96,12 @@ class _LocalEntry:
 
 
 class LocalPane:
-    """Left pane: browse the local filesystem."""
+    """Left pane: browse the local filesystem and manage the upload queue.
+
+    Entries are sorted directories-first, then alphabetically.  Hidden files
+    (names starting with '.') are excluded.  The queue state is passed in at
+    draw time so this class holds no reference to FileBrowser.
+    """
 
     def __init__(self, win, start: Path) -> None:
         self.win = win
@@ -149,7 +172,19 @@ class LocalPane:
             self.refresh()
 
     def draw(self, active: bool, active_pair: int,
-             pending_up: set[str], pending_pair: int) -> None:
+             pending_up: set[str], pending_pair: int,
+             pending_folders: set[str] | None = None,
+             partial_pair: int = 0) -> None:
+        """Render the pane into its curses window.
+
+        Folder queue markers
+        --------------------
+        A folder shows ``[+]`` (pending_pair colour) only if it was
+        explicitly mass-marked via _mark_local_folder() AND at least one of
+        its files is still in pending_up.  It shows ``[~]`` (partial_pair)
+        when some but not all files are queued (e.g. after individual files
+        were removed from the queue).  The ``..`` entry is never marked.
+        """
         win = self.win
         h, w = win.getmaxyx()
         win.erase()
@@ -180,8 +215,20 @@ class LocalPane:
             e   = self.entries[idx]
             row = i + 1
 
-            queued = (not e.is_dir) and str(e.path) in pending_up
-            marker = "[+] " if queued else "    "
+            if e.is_dir and e.name != "..":
+                path_prefix = str(e.path) + os.sep
+                has_any = any(p.startswith(path_prefix) for p in pending_up)
+                is_full = (has_any
+                           and pending_folders is not None
+                           and str(e.path) in pending_folders)
+                queued_state = "full" if is_full else ("partial" if has_any else None)
+            elif not e.is_dir:
+                queued_state = "full" if str(e.path) in pending_up else None
+            else:
+                queued_state = None  # ".." entry — never marked
+
+            marker = "[+] " if queued_state == "full" else (
+                     "[~] " if queued_state == "partial" else "    ")
             label  = (e.name + "/") if e.is_dir else e.name
             size_s = "" if e.is_dir else _fmt_size(e.size)
             avail  = w - 2 - len(marker) - 1
@@ -189,8 +236,10 @@ class LocalPane:
             line   = marker + label[:name_w].ljust(name_w) + " " + size_s.rjust(size_w)
 
             attr = curses.A_BOLD if e.is_dir else curses.A_NORMAL
-            if queued:
+            if queued_state == "full":
                 attr |= curses.color_pair(pending_pair)
+            elif queued_state == "partial" and partial_pair:
+                attr |= curses.color_pair(partial_pair)
             if idx == self.cursor:
                 attr |= curses.A_REVERSE
             try:
@@ -204,7 +253,12 @@ class LocalPane:
 # ── Remote pane ────────────────────────────────────────────────────────────────
 
 class RemotePane:
-    """Right pane: browse the agOO remote storage."""
+    """Right pane: browse agOO remote storage (two-tier: cache and archive).
+
+    Each entry carries the server-supplied fields isDir, isOffline, size, and
+    unarchiveAsked.  The pane augments entries with display_name and api_path
+    (stripped of the leading '/') for consistent rendering and API calls.
+    """
 
     def __init__(self, win, client: Agoo, pending_recalls: set[str]) -> None:
         self.win = win
@@ -413,27 +467,51 @@ def show_menu(stdscr, title: str, options: list[str]) -> str | None:
 # ── Main application ───────────────────────────────────────────────────────────
 
 class FileBrowser:
+    """Main TUI application: event loop, pane management, and all operations.
+
+    Owns the curses screen and two child panes (LocalPane, RemotePane).
+    All background work runs in daemon threads; threads communicate back via
+    msg_q.  The event loop drains msg_q every tick and dispatches results to
+    the UI.  See the module docstring for the full msg_q protocol.
+
+    Upload state machine
+    --------------------
+    Idle:      busy=False, _upload_progress=None, _upload_abort=None
+    Uploading: busy=True,  _upload_progress=dict, _upload_abort=Event
+    Done/err:  busy=False, _upload_progress=None, _upload_abort=None
+    """
 
     def __init__(self, stdscr, client: Agoo) -> None:
         self.stdscr = stdscr
         self.client = client
-        self.pending_recalls: set[str] = set()   # api_paths with active recall
-        self.pending_uploads: set[str] = set()   # absolute local paths queued for upload
+        self.pending_recalls: set[str] = set()         # api_paths with active recall
+        self.pending_uploads: set[str] = set()         # absolute local paths queued for upload
+        self.pending_upload_folders: set[str] = set()  # folders mass-marked via Enter menu
         self.status = "Ready"
-        self.busy   = False                      # True while upload/download blocks UI
+        self.busy   = False                            # True while upload/download blocks UI
         self.msg_q: queue.Queue = queue.Queue()
+        self._upload_abort: threading.Event | None = None
+        self._upload_progress: dict | None = None
+        self._spinner_frame: int = 0
 
         curses.start_color()
         curses.use_default_colors()
         curses.init_pair(1, curses.COLOR_CYAN,   -1)   # active pane title
         curses.init_pair(2, curses.COLOR_YELLOW, -1)   # status bar
-        curses.init_pair(3, curses.COLOR_GREEN,  -1)   # queued-for-upload items
+        curses.init_pair(3, curses.COLOR_GREEN,  -1)   # fully-queued items
+        curses.init_pair(4, curses.COLOR_MAGENTA, -1)  # partially-queued folders
 
         self._italic = getattr(curses, "A_ITALIC", curses.A_UNDERLINE)
 
         self._init_layout()
 
     def _init_layout(self) -> None:
+        """Create or recreate pane windows to fit the current terminal size.
+
+        Called once at startup and again on KEY_RESIZE.  Preserves the
+        current directory and remote path across resizes so navigation state
+        is not lost when the terminal is resized mid-session.
+        """
         h, w = self.stdscr.getmaxyx()
         pane_h  = h - 2
         left_w  = w // 2
@@ -487,8 +565,11 @@ class FileBrowser:
         self.stdscr.erase()
         self._draw_hints()
         self._draw_status()
-        self._local_pane.draw(self.active == 0, 1, self.pending_uploads, 3)
+        self._local_pane.draw(self.active == 0, 1, self.pending_uploads, 3,
+                              self.pending_upload_folders, 4)
         self._remote_pane.draw(self.active == 1, 1, self._italic)
+        if self._upload_progress is not None:
+            self._draw_upload_overlay()
         curses.doupdate()
 
     def _set_status(self, msg: str, busy: bool = False) -> None:
@@ -497,9 +578,96 @@ class FileBrowser:
         self._draw_status()
         curses.doupdate()
 
+    def _draw_upload_overlay(self) -> None:
+        """Render a centred progress popup on top of the browser panes.
+
+        Called both from _draw_all() (full redraws) and directly from the
+        event loop (spinner ticks and progress updates) to avoid repainting
+        the entire screen on every 50 ms tick.
+
+        The progress bar uses max(files_fraction, bytes_fraction) so it never
+        goes backwards regardless of how batching groups the files.
+        """
+        p = self._upload_progress
+        if p is None:
+            return
+        h, w = self.stdscr.getmaxyx()
+        ov_w = min(64, max(40, w - 4))
+        ov_h = 8
+        y = max(0, (h - ov_h) // 2)
+        x = max(0, (w - ov_w) // 2)
+
+        win = curses.newwin(ov_h, ov_w, y, x)
+        win.border()
+
+        _SPINNER = r"|/-\\"
+        spin  = _SPINNER[self._spinner_frame % 4]
+        done  = p["done"]
+        total = p["total"]
+        title = f" {spin} Uploading {done} / {total} "
+        try:
+            win.addstr(0, max(1, (ov_w - len(title)) // 2),
+                       title[:ov_w - 2], curses.A_BOLD)
+        except curses.error:
+            pass
+
+        # Current filename (row 2)
+        filename = os.path.basename(p.get("file", ""))
+        try:
+            win.addstr(2, 2, filename[:ov_w - 4])
+        except curses.error:
+            pass
+
+        # Progress bar: max(files_fraction, bytes_fraction) — never regresses (row 3)
+        bytes_done  = p.get("bytes_done", 0)
+        bytes_total = p.get("bytes_total", 0) or 1
+        files_frac  = done / total if total > 0 else 0.0
+        bytes_frac  = bytes_done / bytes_total
+        pct         = max(files_frac, bytes_frac)
+        bar_w       = ov_w - 10
+        filled      = int(bar_w * pct)
+        bar         = "█" * filled + "░" * (bar_w - filled)
+        try:
+            win.addstr(3, 2, f"{bar}  {pct * 100:.0f}%"[:ov_w - 4])
+        except curses.error:
+            pass
+
+        # Raw metrics (row 4)
+        files_line = f"{done}/{total} files  ·  {_fmt_size(bytes_done)} / {_fmt_size(bytes_total)}"
+        try:
+            win.addstr(4, 2, files_line[:ov_w - 4], curses.A_DIM)
+        except curses.error:
+            pass
+
+        # Abort hint (row 6)
+        try:
+            win.addstr(6, 2, "^C to abort", curses.A_DIM)
+        except curses.error:
+            pass
+
+        win.noutrefresh()
+
+    def _prune_upload_folders(self) -> None:
+        """Remove fully-uploaded folders from pending_upload_folders."""
+        self.pending_upload_folders = {
+            d for d in self.pending_upload_folders
+            if any(p.startswith(d + os.sep) for p in self.pending_uploads)
+        }
+
     # ── Event loop ─────────────────────────────────────────────────────────────
 
     def run(self) -> None:
+        """Enter the curses event loop.  Returns when the user quits.
+
+        Loop structure per iteration
+        ----------------------------
+        1. Drain msg_q (worker-thread results).
+        2. If any message changed visible state, refresh both panes.
+        3. Non-blocking getch().
+           - No key (-1): advance spinner if uploading, then napms(50).
+           - Key while busy: only Ctrl-C (abort) or 'q' (quit) are honoured.
+           - Key while idle: full key dispatch.
+        """
         self.stdscr.nodelay(True)
         self._draw_all()
 
@@ -508,16 +676,25 @@ class FileBrowser:
             changed = False
             while not self.msg_q.empty():
                 kind, data = self.msg_q.get_nowait()
-                if kind == "status":
+                if kind == "upload_progress":
+                    self._upload_progress = data
+                    self._draw_upload_overlay()
+                    curses.doupdate()
+                elif kind == "status":
                     # Blocking operation progress update.
                     self._set_status(data, busy=True)
                 elif kind == "done":
                     # Blocking operation finished successfully.
+                    self._upload_progress = None
+                    self._upload_abort    = None
                     self.busy = False
                     self._set_status(data)
+                    self._prune_upload_folders()
                     changed = True
                 elif kind == "error":
                     # Blocking operation failed.
+                    self._upload_progress = None
+                    self._upload_abort    = None
                     self.busy = False
                     self._set_status(f"Error: {data}")
                     changed = True
@@ -542,12 +719,22 @@ class FileBrowser:
 
             key = self.stdscr.getch()
             if key == -1:
+                if self.busy and self._upload_progress is not None:
+                    # Advance spinner on every idle tick while an upload is running.
+                    self._spinner_frame += 1
+                    self._draw_upload_overlay()
+                    curses.doupdate()
                 curses.napms(50)
                 continue
 
-            # While a blocking operation runs, only allow quit.
+            # While a blocking operation runs: Ctrl-C aborts upload; q quits.
             if self.busy:
-                if key in (ord('q'), ord('Q')):
+                if key == 3:  # Ctrl-C
+                    if self._upload_abort is not None:
+                        self._upload_abort.set()
+                        self._set_status(
+                            "Aborting… waiting for current file to finish", busy=True)
+                elif key in (ord('q'), ord('Q')):
                     break
                 continue
 
@@ -699,7 +886,11 @@ class FileBrowser:
         # unarchiveAsked=True has already been recalled and is downloadable.
         pending    = is_offline and (e.get("unarchiveAsked", False)
                                      or api_path in self.pending_recalls)
-        local_dest = str(self._local_pane.path / display)
+        local_dest = self._safe_local_dest(display)
+        if local_dest is None:
+            self._set_status(f"Blocked: '{display}' path escapes local directory.")
+            self._draw_all()
+            return
 
         if not is_offline:
             # File is in cache — Download, Unmark (return to archive), and Delete.
@@ -745,8 +936,15 @@ class FileBrowser:
         return result
 
     def _mark_local_folder(self, path: Path) -> None:
+        """Queue every non-hidden file under *path* and record it as fully-marked.
+
+        Recording in pending_upload_folders lets LocalPane.draw() distinguish
+        fully-marked folders ([+]) from folders where only some files are
+        queued ([~]) after individual files have been unqueued.
+        """
         files = self._collect_local_files(path)
         self.pending_uploads.update(files)
+        self.pending_upload_folders.add(str(path))
         self._set_status(
             f"Queued {len(files)} file(s) from {path.name}/  "
             f"({len(self.pending_uploads)} total pending — press 's' to upload)"
@@ -818,10 +1016,17 @@ class FileBrowser:
             for item in online:
                 api_path   = item.get("path", "").lstrip("/")
                 name       = item.get("name", api_path)
-                local_dest = str(local_base / name)
+                local_dest = (local_base / name).resolve()
+                # Guard against server-supplied names that contain ../
+                try:
+                    local_dest.relative_to(local_base.resolve())
+                except ValueError:
+                    self.msg_q.put(("recall_error",
+                                    f"Blocked: '{name}' path escapes local directory."))
+                    continue
                 threading.Thread(
                     target=self._download_single,
-                    args=(api_path, name, local_dest),
+                    args=(api_path, name, str(local_dest)),
                     daemon=True,
                 ).start()
 
@@ -838,11 +1043,30 @@ class FileBrowser:
             self.msg_q.put(("recall_error",
                             f"Download failed for {display}: {self.client.error()}"))
 
+    # ── Path helpers ───────────────────────────────────────────────────────────
+
+    def _safe_local_dest(self, filename: str) -> str | None:
+        """Return the resolved local path for *filename* only if it stays inside
+        the current local-pane directory.
+
+        A remote server could theoretically return a display name containing
+        ``../`` components.  Resolving against the current directory and then
+        checking the prefix prevents writes outside the intended location.
+        Returns None (and does not download) if the path would escape.
+        """
+        base = self._local_pane.path.resolve()
+        dest = (base / filename).resolve()
+        try:
+            dest.relative_to(base)
+            return str(dest)
+        except ValueError:
+            return None
+
     # ── Operations ─────────────────────────────────────────────────────────────
 
     def _do_unmark(self, api_path: str, display: str) -> None:
-        """Remove a file from cache, keeping the archive copy (schedule_migrate)."""
-        ok = self.client.schedule_migrate(api_path)
+        """Return a cached file to archive via schedule_unmigrate."""
+        ok = self.client.schedule_unmigrate(api_path)
         if ok:
             self._set_status(f"Unmarked: {display}  (returned to archive).")
             self._remote_pane.refresh()
@@ -851,6 +1075,7 @@ class FileBrowser:
             self._set_status(f"Unmark failed: {self.client.error()}")
 
     def _do_delete(self, api_path: str, display: str) -> None:
+        """Permanently delete a file from remote storage (cache + archive)."""
         result = self.client.temp_del(api_path)
         if result is not None:
             self._set_status(f"Deleted {display}.")
@@ -897,16 +1122,38 @@ class FileBrowser:
         self._do_upload(sorted(self.pending_uploads))
 
     def _do_upload(self, paths: list[str]) -> None:
-        """Blocking upload — locks the UI until complete."""
+        """Start a batched upload of *paths* and show the progress overlay.
+
+        Sets busy=True for the duration; the overlay is dismissed automatically
+        when the worker thread sends "done" or "error".  Ctrl-C sets the abort
+        event and stops the loop after the current file finishes.
+        """
         label = f"{len(paths)} file(s)"
+        abort = threading.Event()
+        self._upload_abort    = abort
+        self._upload_progress = {
+            "file": paths[0] if paths else "",
+            "done": 0, "total": len(paths),
+            "bytes_done": 0, "bytes_total": 0,
+        }
         self._set_status(f"Uploading {label}…", busy=True)
+        self._draw_all()   # show overlay immediately before first file starts
+
+        def _on_progress(f: str, done: int, total: int,
+                         bytes_done: int, bytes_total: int) -> None:
+            self.msg_q.put(("upload_progress", {
+                "file": f, "done": done, "total": total,
+                "bytes_done": bytes_done, "bytes_total": bytes_total,
+            }))
 
         def _work() -> None:
-            self.msg_q.put(("status", f"Uploading {label}…"))
-            ok = self.client.batch_put(paths)
+            ok = self.client.batch_put(paths, progress=_on_progress,
+                                       abort_event=abort)
             if ok:
                 self.pending_uploads.difference_update(paths)
                 self.msg_q.put(("done", f"Uploaded {label} successfully."))
+            elif abort.is_set():
+                self.msg_q.put(("error", "Upload aborted."))
             else:
                 self.msg_q.put(("error", self.client.error() or "upload failed"))
 
