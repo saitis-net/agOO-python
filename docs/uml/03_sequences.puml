@@ -171,7 +171,63 @@ bp --> caller : True
 
 
 ' ═══════════════════════════════════════════════════════════════
-' 4. Evict cached file back to archive (schedule_migrate)
+' 4. Filebrowser: cached file context menu (● / ✗ states)
+' ═══════════════════════════════════════════════════════════════
+
+newpage Filebrowser: cached file context menu
+
+participant "User" as user
+participant "FileBrowser\n_handle_remote_enter()" as fb
+participant "Agoo" as agoo
+participant "agOO server" as server
+
+note over user, server
+  File is in cache (isOffline=false).
+  Menu label depends on unarchiveAsked flag.
+end note
+
+user -> fb : Enter on ● cached file
+
+alt unarchiveAsked = false  (file not yet marked)
+  fb -> user : menu: "Download to local"\n       "Mark for retrieval"\n       "Delete from remote"
+
+  user -> fb : select "Mark for retrieval"
+  fb -> agoo : schedule_unmigrate(api_path)\n(rename=false)
+  agoo -> server : PATCH api/resources/<path>\n  ?action=copy&rename=false
+  server --> agoo : 200 OK
+  agoo --> fb : response (truthy)
+  fb -> fb : _set_status("Marked: … (marked for retrieval)")
+  fb -> fb : remote pane refresh
+
+  note right of server
+    unarchiveAsked = true.
+    File still in cache (isOffline=false).
+    Displayed as ✗ (dim) in remote pane.
+    Caller must run async_synchronize()
+    to actually evict the file.
+  end note
+
+else unarchiveAsked = true  (already marked)
+  fb -> user : menu: "Download to local"\n       "Unmark (return to archive)"\n       "Delete from remote"
+
+  user -> fb : select "Unmark (return to archive)"
+  fb -> agoo : schedule_migrate(api_path)\n(rename=true)
+  agoo -> server : PATCH api/resources/<path>\n  ?action=copy&rename=true
+  server --> agoo : 200 OK
+  agoo --> fb : response (truthy)
+  fb -> fb : _set_status("Unmarked: … (returned to archive)")
+  fb -> fb : remote pane refresh
+
+  note right of server
+    File evicted from cache.
+    isOffline=true, unarchiveAsked=false.
+    Displayed as ○ (dim) in remote pane.
+  end note
+end
+
+
+' ═══════════════════════════════════════════════════════════════
+' 5. Evict cached file back to archive — schedule_migrate (rename=true)
 ' ═══════════════════════════════════════════════════════════════
 
 newpage Evict cache to archive (schedule_migrate)
@@ -200,7 +256,7 @@ end note
 
 
 ' ═══════════════════════════════════════════════════════════════
-' 5. Recall archived file to cache (schedule_unmigrate)
+' 6. Recall archived file to cache — schedule_unmigrate (rename=false)
 ' ═══════════════════════════════════════════════════════════════
 
 newpage Recall from archive to cache (schedule_unmigrate)

@@ -106,9 +106,13 @@ note right of Agoo
   Archive operations (same endpoint, different rename= flag)
   ──────────────────────────────────────────────────────────
   schedule_migrate(f)    rename=true  → evict cache, keep archive
-  schedule_unmigrate(f)  rename=false → copy archive to cache (recall)
-  Note: schedule_unmigrate only schedules the recall.
-  The caller must call async_synchronize() to trigger it.
+                         → file becomes isOffline=true
+  schedule_unmigrate(f)  rename=false → mark for recall / mark for eviction
+                         → sets unarchiveAsked=true
+                         → caller must call async_synchronize() to trigger
+  Note: on a cached file (isOffline=false), schedule_unmigrate sets
+  unarchiveAsked=true without moving the file (shown as ✗ in TUI).
+  On an archived file (isOffline=true), it schedules a recall (shown as ↑).
 end note
 
 @enduml

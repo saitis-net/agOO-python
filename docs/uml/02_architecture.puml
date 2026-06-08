@@ -112,6 +112,12 @@ note bottom of temp
   Files here are isOffline = false.
   Accessible via api/raw/ for download.
   Subject to capacity limits (get_usage).
+
+  Filebrowser remote-pane indicators:
+    ●  isOffline=false, unarchiveAsked=false  (cached, normal)
+    ✗  isOffline=false, unarchiveAsked=true   (cached, marked for eviction)
+    ↑  isOffline=true,  unarchiveAsked=true   (offline, recall in progress)
+    ○  isOffline=true,  unarchiveAsked=false  (archived)
 end note
 
 note bottom of archive
