@@ -51,6 +51,7 @@ Threading model
     recall_done      str — background recall/download succeeded
     recall_status    str — background recall progress note
     recall_error     str — background recall/download failed
+    remote_listing   (path, items|None) — result of a background remote refresh
 
 Credentials
 -----------
@@ -753,6 +754,22 @@ class FileBrowser:
             if any(p.startswith(d + os.sep) for p in self.pending_uploads)
         }
 
+    def _spawn_remote_refresh(self) -> None:
+        """Fetch the remote listing in a background thread (non-blocking).
+
+        Captures the current remote_path at dispatch time and posts
+        ("remote_listing", (path, items)) on msg_q when done.  The event
+        loop applies the result only if the pane has not navigated away
+        since the request was issued.
+        """
+        path = self._remote_pane.remote_path
+
+        def _work() -> None:
+            items = self.client.list_resources(path)
+            self.msg_q.put(("remote_listing", (path, items)))
+
+        threading.Thread(target=_work, daemon=True).start()
+
     # ── Event loop ─────────────────────────────────────────────────────────────
 
     def run(self) -> None:
@@ -810,10 +827,26 @@ class FileBrowser:
                     # Background recall failed (non-blocking).
                     if not self.busy:
                         self._set_status(f"Recall error: {data}")
+                elif kind == "remote_listing":
+                    # Result of a background remote pane refresh.
+                    r_path, items = data
+                    if r_path == self._remote_pane.remote_path:
+                        if items is None:
+                            self._remote_pane.error = (
+                                self.client.error() or "listing failed")
+                            self._remote_pane.entries = []
+                            self._remote_pane._clamp()
+                        else:
+                            self._remote_pane.error = None
+                            self._remote_pane._build(items)
+                        self._draw_all()
 
             if changed:
-                self._remote_pane.refresh()
+                # Refresh local pane immediately (fast, no network I/O).
+                # Remote pane refresh is dispatched to a background thread
+                # so the UI is never blocked waiting for the server.
                 self._local_pane.refresh()
+                self._spawn_remote_refresh()
                 self._draw_all()
 
             key = self.stdscr.getch()
