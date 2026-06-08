@@ -1,0 +1,124 @@
+@startuml agoo_class
+' Class diagram for the agoo Python client library.
+' Render with: plantuml docs/uml/01_class.puml
+
+skinparam classAttributeIconSize 0
+skinparam classFontSize 12
+skinparam packageFontSize 13
+skinparam noteFontSize 11
+
+package "requests (stdlib)" {
+  class "requests.Session" as Session <<external>>
+}
+
+package "agoo" {
+
+  class "_SafeSession" as SafeSession {
+    ' Drops X-Auth on cross-origin redirects (F-02).
+    ' Disables cookie storage entirely (F-10).
+    + cookies : RequestsCookieJar
+    --
+    + rebuild_auth(prepared_request, response) : None
+  }
+
+  class "Agoo" {
+    .. State ..
+    - _config : dict
+    - _auth_token : str | None
+    - _error : str | None
+    - _session : _SafeSession
+    .. Construction ..
+    + __init__(**cfg)
+    .. Public helpers ..
+    + url() : str
+    + error() : str | None
+    .. Path security (static) ..
+    - {static} _validate_local_path(path)
+    - {static} _validate_output_path(path)
+    - {static} _dirname(path) : str
+    - {static} _stamp_unique() : str
+    .. HTTP layer ..
+    - _do(method, path, body, stream, **hdrs)
+    - _get(path)
+    - _get_stream(path)
+    - _post(path, body)
+    - _patch(path, body)
+    - _delete(path)
+    - _tus_get_offset(tus_path) : int | None
+    .. Authentication ..
+    + login() : bool
+    + logout() : None
+    .. Metadata & listing ..
+    + stat(what) : dict | None
+    + list_resources(path) : list | None
+    + get_usage() : dict | None
+    + temp_sum(f, hash_type) : str | None
+    .. Upload (temp/cache) ..
+    + temp_put_fake(f)
+    + temp_put(f, override) : bool | None
+    + batch_put(files, poll_interval,\n  override, progress, abort_event) : bool | None
+    .. Download (temp/cache) ..
+    + temp_get(f) : bytes | None
+    + temp_get_file(f, output_path) : bool | None
+    .. Delete (cache only — archive unaffected) ..
+    + temp_del(f)
+    .. Archive operations (scheduled) ..
+    + schedule_migrate(f)
+    + schedule_unmigrate(f)
+    .. Async jobs ..
+    + async_synchronize() : str | None
+    + async_completed(job_id) : int | None
+    + terminate()
+  }
+
+}
+
+SafeSession --|> Session
+Agoo *-- SafeSession : _session
+
+note right of SafeSession
+  Security hardening on top of requests.Session:
+  • __init__() replaces the cookie jar with an empty
+    non-accumulating one (server cookies rejected).
+  • rebuild_auth() drops X-Auth when a redirect
+    crosses to a different host.
+end note
+
+note bottom of Agoo
+  All API paths resolve to: base_url / user / <path>
+  _auth_token is None until login() succeeds.
+  Every failing method sets _error (read via error()).
+  HTTPS is enforced at construction time for both
+  base_url and start_url.
+end note
+
+note right of Agoo
+  __init__ kwargs
+  ──────────────
+  base_url   https:// root of the agOO install
+  start_url  https:// CGI that wakes a stopped instance
+  login      agOO username (default: "admin")
+  user       API namespace / sub-path
+  password   login password (or env agOO_PASSWORD)
+  debug      True → print diagnostics to stderr
+  io_size    TUS chunk size in bytes (default 10 MiB)
+
+  Archive operations — same PATCH endpoint, different rename= flag
+  ────────────────────────────────────────────────────────────────
+  schedule_migrate(f)
+    rename=true → MOVE: cached copy evicted, archive preserved.
+    Result: isOffline=true, unarchiveAsked=false.
+
+  schedule_unmigrate(f)
+    rename=false → COPY: sets unarchiveAsked=true.
+    Dual role depending on current file state:
+      isOffline=true  (archived) → schedules recall (file shows ↑)
+      isOffline=false (cached)   → marks as available/recalled (file shows ●)
+    Caller must call async_synchronize() to trigger the server job.
+
+  temp_del(f)
+    Removes the cached copy only; archive copy is NOT affected.
+    Use schedule_migrate() to return a file to archive while keeping it.
+end note
+
+@enduml

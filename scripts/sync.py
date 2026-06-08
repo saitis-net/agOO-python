@@ -38,8 +38,8 @@ from agoo import Agoo
 # ---------------------------------------------------------------------------
 # Credentials — must be supplied via environment variables; no fallback.
 # ---------------------------------------------------------------------------
-LOGIN    = os.environ.get("agOO_USER")
-PASSWORD = os.environ.get("agOO_PASSWORD")
+_USER     = os.environ.get("agOO_USER")
+_PASSWORD = os.environ.get("agOO_PASSWORD")
 
 # How often to poll for job completion, in seconds.
 DEFAULT_POLL_INTERVAL = 30
@@ -48,7 +48,7 @@ def main() -> int:
     # -----------------------------------------------------------------------
     # Credential check — fail fast before touching the network.
     # -----------------------------------------------------------------------
-    missing = [name for name, val in (("agOO_USER", LOGIN), ("agOO_PASSWORD", PASSWORD))
+    missing = [name for name, val in (("agOO_USER", _USER), ("agOO_PASSWORD", _PASSWORD))
                if val is None]
     if missing:
         for name in missing:
@@ -66,13 +66,11 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    client = Agoo(
-        user=LOGIN,
-        login=LOGIN,
-        password=PASSWORD,
-    )
+    # `login` is the credential username for POST /api/login (always "admin").
+    # `user`  is the API namespace embedded in every URL path (agOO_USER).
+    client = Agoo(user=_USER, login="admin", password=_PASSWORD)
 
-    print(f"Authenticating as '{LOGIN}'…")
+    print(f"Authenticating as '{_USER}'…")
     if not client.login():
         print(f"Login failed: {client.error()}", file=sys.stderr)
         return 1

@@ -192,10 +192,21 @@ def main() -> int:
         else:
             print(f"\nUploading {len(args.files)} file(s) (existing files will be skipped)…")
 
+        def _on_progress(path: str, done: int, total: int,
+                         bytes_done: int, bytes_total: int) -> None:
+            pct = int(bytes_done / bytes_total * 100) if bytes_total else 0
+            print(
+                f"  [{done}/{total}] {os.path.basename(path)}"
+                f"  {_fmt_bytes(bytes_done)} / {_fmt_bytes(bytes_total)}"
+                f"  ({pct}%)",
+                flush=True,
+            )
+
         result = client.batch_put(
             args.files,
             poll_interval=args.poll_interval,
             override=args.force,
+            progress=_on_progress,
         )
 
         if result is None:

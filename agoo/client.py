@@ -83,10 +83,12 @@ class _SafeSession(requests.Session):
     """
 
     def __init__(self) -> None:
+        """Replace the default cookie jar with an empty, non-accumulating one."""
         super().__init__()
         self.cookies = requests.cookies.RequestsCookieJar()  # reject all server cookies
 
     def rebuild_auth(self, prepared_request, response) -> None:
+        """Drop X-Auth when a redirect crosses to a different host."""
         super().rebuild_auth(prepared_request, response)
         if urlparse(response.url).netloc != urlparse(prepared_request.url).netloc:
             prepared_request.headers.pop("X-Auth", None)
@@ -327,6 +329,7 @@ class Agoo:
     # -------------------------------------------------------------------
 
     def _get(self, path: str, **headers):
+        """Thin wrapper around _do(); see _do() for retry and auth behaviour."""
         return self._do("GET", path, **headers)
 
     def _get_stream(self, path: str, **headers):
@@ -343,12 +346,15 @@ class Agoo:
         return self._do("GET", path, stream=True, **headers)
 
     def _post(self, path: str, body=None, **headers):
+        """Thin wrapper around _do(); see _do() for retry and auth behaviour."""
         return self._do("POST", path, body=body, **headers)
 
     def _patch(self, path: str, body=None, **headers):
+        """Thin wrapper around _do(); see _do() for retry and auth behaviour."""
         return self._do("PATCH", path, body=body, **headers)
 
     def _delete(self, path: str, **headers):
+        """Thin wrapper around _do(); see _do() for retry and auth behaviour."""
         return self._do("DELETE", path, **headers)
 
     def _tus_get_offset(self, tus_path: str) -> int | None:
@@ -561,16 +567,17 @@ class Agoo:
         return False
 
     def logout(self) -> None:
-        """Terminate the backend instance and clear the local session token.
+        """Clear the local session token.
 
-        Calls terminate() to shut down the agOO backend, then discards the
-        local auth token so the client object becomes inert. Authenticated
-        calls will raise RuntimeError until login() is called again.
+        Discards the local auth token so the client object becomes inert.
+        Authenticated calls will raise RuntimeError until login() is called again.
+        The backend instance is left running so that other clients (e.g. the
+        web UI) are not affected.
         """
-        self.terminate()
         self._auth_token = None
 
     def __del__(self) -> None:
+        """Clear the auth token when the object is garbage-collected (mirrors logout())."""
         self._auth_token = None
 
     # -------------------------------------------------------------------
@@ -605,6 +612,42 @@ class Agoo:
     # -------------------------------------------------------------------
     # Actions on temp storage
     # -------------------------------------------------------------------
+
+    def list_resources(self, path: str = "") -> list[dict] | None:
+        """List the contents of a remote directory.
+
+        Calls GET api/resources/<path> (or api/resources/ for the root) and
+        returns the `items` array from the response.  Each element is a dict
+        that includes at minimum:
+
+          name           : entry basename (e.g. "vEOS-4.31.1F.swi")
+          path           : absolute remote path (e.g. "/eos/vEOS-4.31.1F.swi")
+          size           : file size in bytes
+          isDir          : True for directory entries
+          isOffline      : True when the file is in archive storage
+          unarchiveAsked : True when an archive recall has been requested
+
+        The _get_stream() variant is used so that the 1 MiB non-streaming
+        response cap in _do() does not truncate large directory listings.
+
+        Returns a list of dicts on success, None on failure.
+        """
+        endpoint = ("api/resources/" + uri_escape(path)) if path else "api/resources/"
+        response = self._get_stream(endpoint)
+        if response is None:
+            return None
+        try:
+            data = json.loads(response.text)
+            if isinstance(data, list):
+                return data
+            if isinstance(data, dict):
+                return data.get("items", [])
+            return []
+        except json.JSONDecodeError as exc:
+            self._error = f"list_resources: server returned invalid JSON: {exc}"
+            return None
+        finally:
+            response.close()
 
     def get_usage(self) -> dict | None:
         """Fetch storage usage statistics from the agOO service.
@@ -927,7 +970,9 @@ class Agoo:
         return True
 
     def batch_put(self, files: list[str], poll_interval: int = 30,
-                  override: bool = False) -> bool | None:
+                  override: bool = False,
+                  progress=None,
+                  abort_event=None) -> bool | None:
         """Upload a list of local files, automatically batching and syncing.
 
         Use this method when the combined size of all files may exceed the
@@ -969,6 +1014,14 @@ class Agoo:
         override      : passed through to temp_put() for each file; if True,
                         existing copies on the server are replaced rather than
                         skipped (default False).
+        progress      : optional callable invoked after each successful upload.
+                        Signature: progress(path, files_done, files_total,
+                                            bytes_done, bytes_total).
+                        Called from the same thread as batch_put(); must be
+                        non-blocking.
+        abort_event   : optional threading.Event; when set, the upload loop
+                        stops cleanly after the current file and returns None
+                        with self.error() set to "upload aborted by user".
 
         Returns
         -------
@@ -1046,6 +1099,11 @@ class Agoo:
         # `pending` holds the files not yet uploaded, in original order.
         # Each iteration of the while-loop processes one batch.
         # ------------------------------------------------------------------
+        total_files = len(file_entries)
+        total_bytes = sum(size for _, size in file_entries)
+        files_done  = 0
+        bytes_done  = 0
+
         pending = list(file_entries)   # mutable working copy
         batch_number = 0
 
@@ -1129,6 +1187,9 @@ class Agoo:
             # above and the actual upload of each file.
             # ---------------------------------------------------------------
             for f, size in current_batch:
+                if abort_event is not None and abort_event.is_set():
+                    self._error = "upload aborted by user"
+                    return None
                 self._debug(
                     f"batch_put: [{batch_number}] uploading '{f}' ({size:,} bytes)…"
                 )
@@ -1136,6 +1197,21 @@ class Agoo:
                     # temp_put() already populated self._error.
                     return None
                 self._debug(f"batch_put: [{batch_number}] '{f}' uploaded OK")
+                files_done += 1
+                bytes_done += size
+                if progress is not None:
+                    progress(f, files_done, total_files, bytes_done, total_bytes)
+                if abort_event is not None and abort_event.is_set():
+                    self._error = "upload aborted by user"
+                    return None
+                # Refresh usage after each upload so that space consumed by
+                # other concurrent clients is reflected before the next file.
+                usage = self.get_usage()
+                if usage is not None:
+                    used      = usage.get("used", 0)
+                    total     = usage.get("total", 0)
+                    usable    = int(total * (1.0 - _CACHE_SAFETY_MARGIN))
+                    available = max(0, usable - used)
 
             self._debug(
                 f"batch_put: batch {batch_number} complete "
@@ -1383,8 +1459,9 @@ class Agoo:
         return True
 
     def temp_del(self, f: str):
-        """Delete a file from temp storage.
+        """Delete a file from temp (cache) storage.
 
+        Removes the cached copy only; any archive copy is unaffected.
         Returns the response object on success, None on failure.
         """
         return self._delete("api/resources/" + uri_escape(f))
@@ -1393,19 +1470,43 @@ class Agoo:
     # Actions on archive storage (queued until async_synchronize() is called)
     # -------------------------------------------------------------------
 
-    def schedule_migrate(self) -> bool:
-        """Schedule a migration of temp files to archive storage.
+    def schedule_migrate(self, f: str):
+        """Evict a cached file back to archive storage (rename=true → MOVE).
 
-        Currently a no-op; migration is handled implicitly by the server.
-        Returns True to indicate "scheduled" (mirrors Perl `return 1`).
+        Uses the same PATCH endpoint as schedule_unmigrate() but with
+        rename=true, which tells the server to move rather than copy:
+          PATCH /api/resources/<path>?action=copy&override=true&rename=true&...
+
+        The cached copy is removed; the archive copy is preserved.  After
+        this call the file will appear as isOffline=true, unarchiveAsked=false
+        in list_resources() and can be recalled with schedule_unmigrate().
+
+        Returns the response object on success, None on failure.
         """
-        return True
+        return self._patch(
+            "api/resources/" + uri_escape(f)
+            + "?action=copy&override=true&rename=true&destination=/"
+            + uri_escape(f)
+        )
 
     def schedule_unmigrate(self, f: str):
-        """Schedule a copy of an archive file back to temp storage.
+        """Set unarchiveAsked=true on a file (rename=false → COPY, archive kept).
 
-        Uses a PATCH action query-parameter to request a server-side copy:
-          PATCH /api/resources/<path>?action=copy&override=true&...
+        Uses a PATCH action query-parameter:
+          PATCH /api/resources/<path>?action=copy&override=true&rename=false&...
+
+        Dual behaviour depending on the current file state:
+          isOffline=true  (archived)  → schedules a recall to cache.
+                                        File shows as ↑ in the TUI until the
+                                        job completes (isOffline becomes false).
+          isOffline=false (cached)    → marks the file with unarchiveAsked=true
+                                        without moving it.  File shows as ✗ in
+                                        the TUI.
+
+        IMPORTANT: this call only sets the flag.  Call async_synchronize()
+        afterwards to trigger the server-side job.  Poll async_completed() to
+        wait for completion; the file becomes isOffline=false when done
+        (typically within a minute for small files).
 
         Returns the response object on success, None on failure.
         """
