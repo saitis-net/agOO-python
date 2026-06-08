@@ -171,35 +171,69 @@ bp --> caller : True
 
 
 ' ═══════════════════════════════════════════════════════════════
-' 4. Archive recall
+' 4. Evict cached file back to archive (schedule_migrate)
 ' ═══════════════════════════════════════════════════════════════
 
-newpage Archive recall (schedule_unmigrate)
+newpage Evict cache to archive (schedule_migrate)
 
 participant "Caller" as caller
 participant "Agoo" as agoo
 participant "agOO server" as server
 
-caller -> agoo : schedule_unmigrate("eos/image.swi")
-agoo -> server : PATCH api/resources/eos/image.swi\n  ?action=copy\n  &override=true\n  &rename=false\n  &destination=/eos/image.swi
-
-note right of server
-  Server queues an async copy job:
-  archive → temp (cache).
-  The file appears as isOffline=true
-  with unarchiveAsked=true until the
-  job completes.
+note over caller, server
+  Use when a file is in cache (isOffline=false) and you want
+  to move it back to archive storage (isOffline=true).
+  rename=true means MOVE: the cached copy is removed.
 end note
+
+caller -> agoo : schedule_migrate("eos/image.swi")
+agoo -> server : PATCH api/resources/eos/image.swi\n  ?action=copy\n  &override=true\n  &rename=true\n  &destination=/eos/image.swi
 
 server --> agoo : 200 OK
 agoo --> caller : response (truthy)
 
-caller -> caller : poll list_resources() until\nisOffline=false\n(file is back in cache)
+note right of server
+  File is evicted from cache.
+  isOffline=true, unarchiveAsked=false.
+  Archive copy is preserved.
+end note
 
-caller -> agoo : temp_get_file("eos/image.swi", "/local/image.swi")
-agoo -> server : GET api/raw/eos/image.swi\n(stream=True)
-server --> agoo : 200 + file stream
-agoo -> agoo : write chunks to disk
-agoo --> caller : True
+
+' ═══════════════════════════════════════════════════════════════
+' 5. Recall archived file to cache (schedule_unmigrate)
+' ═══════════════════════════════════════════════════════════════
+
+newpage Recall from archive to cache (schedule_unmigrate)
+
+participant "Caller" as caller
+participant "Agoo" as agoo
+participant "agOO server" as server
+
+note over caller, server
+  Use when a file is in archive (isOffline=true) and you want
+  it recalled to cache.  rename=false means COPY: archive is kept.
+  The caller is responsible for triggering async_synchronize()
+  to start the actual recall job.
+end note
+
+caller -> agoo : schedule_unmigrate("eos/image.swi")
+agoo -> server : PATCH api/resources/eos/image.swi\n  ?action=copy\n  &override=true\n  &rename=false\n  &destination=/eos/image.swi
+
+server --> agoo : 200 OK
+agoo --> caller : response (truthy)
+
+note right of server
+  Recall is scheduled.
+  isOffline=true, unarchiveAsked=true.
+  File stays offline until async job runs.
+end note
+
+caller -> caller : (caller's responsibility)\ncall async_synchronize()\nand poll async_completed()
+
+note over caller
+  async_synchronize() triggers the server job.
+  async_completed() returns 0 when done.
+  File becomes isOffline=false (~40–60 s for small files).
+end note
 
 @enduml

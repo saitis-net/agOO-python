@@ -63,7 +63,7 @@ package "agoo" {
     .. Delete ..
     + temp_del(f)
     .. Archive operations (scheduled) ..
-    + schedule_migrate(f) : bool
+    + schedule_migrate(f)
     + schedule_unmigrate(f)
     .. Async jobs ..
     + async_synchronize() : str | None
@@ -102,6 +102,13 @@ note right of Agoo
   password   login password (or env agOO_PASSWORD)
   debug      True → print diagnostics to stderr
   io_size    TUS chunk size in bytes (default 10 MiB)
+
+  Archive operations (same endpoint, different rename= flag)
+  ──────────────────────────────────────────────────────────
+  schedule_migrate(f)    rename=true  → evict cache, keep archive
+  schedule_unmigrate(f)  rename=false → copy archive to cache (recall)
+  Note: schedule_unmigrate only schedules the recall.
+  The caller must call async_synchronize() to trigger it.
 end note
 
 @enduml

@@ -10,7 +10,7 @@ actor "Caller\n(script / TUI)" as caller
 rectangle "agoo Python library" {
 
   rectangle "Security layer" as sec {
-    component "_validate_local_path()\n_validate_output_path()\n_safe_local_dest()" as valid #LightYellow
+    component "_validate_local_path()\n_validate_output_path()\n_safe_local_dest()\n(path-traversal guards)" as valid #LightYellow
     note right of valid
       • Rejects null bytes
       • Rejects relative path traversal
@@ -30,7 +30,7 @@ rectangle "agoo Python library" {
     component "Upload\ntemp_put() / temp_put_fake()\nbatch_put()" as upload_comp #PaleGreen
     component "Download\ntemp_get() / temp_get_file()" as download_comp #PaleGreen
     component "Delete\ntemp_del()" as delete_comp #PaleGreen
-    component "Archive ops\nschedule_migrate()\nschedule_unmigrate()" as archive_comp #PaleGreen
+    component "Archive ops\nschedule_migrate()  rename=true\nschedule_unmigrate()  rename=false" as archive_comp #PaleGreen
     component "Async jobs\nasync_synchronize()\nasync_completed()\nterminate()" as async_comp #PaleGreen
   }
 
@@ -43,7 +43,8 @@ rectangle "agOO server (HTTPS)" {
     component "GET    api/usage" as ep_usage
     component "GET    api/resources/<path>" as ep_res_get
     component "DELETE api/resources/<path>" as ep_res_del
-    component "PATCH  api/resources/<path>?action=copy" as ep_res_patch
+    component "PATCH  api/resources/<path>?action=copy&rename=true  (migrate)" as ep_res_patch_migrate
+    component "PATCH  api/resources/<path>?action=copy&rename=false (unmigrate)" as ep_res_patch_unmigrate
     component "GET    api/raw/<path>" as ep_raw
     component "POST   api/tus/<path>" as ep_tus_post
     component "PATCH  api/tus/<path>" as ep_tus_patch
@@ -98,7 +99,8 @@ ep_res_del   --> temp : delete cached copy
 ep_raw       --> temp : stream file content
 ep_usage     --> temp : read capacity stats
 ep_usage     --> archive : read capacity stats
-ep_res_patch --> migrator : enqueue recall job
+ep_res_patch_migrate   --> temp    : evict cached copy\n(move to archive)
+ep_res_patch_unmigrate --> migrator : enqueue recall job\n(async_synchronize triggers it)
 ep_term      --> temp : shutdown signal
 
 ' Async sync loop: batch_put uploads a sentinel file to trigger archival
