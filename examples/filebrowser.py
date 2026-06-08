@@ -680,8 +680,8 @@ class FileBrowser:
         event loop (spinner ticks and progress updates) to avoid repainting
         the entire screen on every 50 ms tick.
 
-        The progress bar uses max(files_fraction, bytes_fraction) so it never
-        goes backwards regardless of how batching groups the files.
+        The progress bar is a weighted average: 50% file-count advancement
+        plus 50% volume advancement, giving equal weight to both dimensions.
         """
         p = self._upload_progress
         if p is None:
@@ -713,12 +713,12 @@ class FileBrowser:
         except curses.error:
             pass
 
-        # Progress bar: max(files_fraction, bytes_fraction) — never regresses (row 3)
+        # Progress bar: 50% file-count + 50% volume (row 3)
         bytes_done  = p.get("bytes_done", 0)
         bytes_total = p.get("bytes_total", 0) or 1
         files_frac  = done / total if total > 0 else 0.0
         bytes_frac  = bytes_done / bytes_total
-        pct         = max(files_frac, bytes_frac)
+        pct         = 0.5 * files_frac + 0.5 * bytes_frac
         bar_w       = ov_w - 10
         filled      = int(bar_w * pct)
         bar         = "█" * filled + "░" * (bar_w - filled)
