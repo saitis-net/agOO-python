@@ -655,8 +655,12 @@ class FileBrowser:
         self.stdscr.erase()
         self._draw_hints()
         self._draw_status()
-        self._local_pane.draw(self.active == 0, 1, self.pending_uploads, 3,
-                              self.pending_upload_folders, 4)
+        # Snapshot both sets before passing to draw() so that the worker
+        # thread calling pending_uploads.difference_update() cannot mutate
+        # them mid-iteration inside LocalPane.draw().
+        self._local_pane.draw(self.active == 0, 1,
+                              frozenset(self.pending_uploads), 3,
+                              frozenset(self.pending_upload_folders), 4)
         self._remote_pane.draw(self.active == 1, 1, self._italic)
         if self._upload_progress is not None:
             self._draw_upload_overlay()
