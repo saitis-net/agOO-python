@@ -1172,6 +1172,14 @@ class Agoo:
                     # temp_put() already populated self._error.
                     return None
                 self._debug(f"batch_put: [{batch_number}] '{f}' uploaded OK")
+                # Refresh usage after each upload so that space consumed by
+                # other concurrent clients is reflected before the next file.
+                usage = self.get_usage()
+                if usage is not None:
+                    used      = usage.get("used", 0)
+                    total     = usage.get("total", 0)
+                    usable    = int(total * (1.0 - _CACHE_SAFETY_MARGIN))
+                    available = max(0, usable - used)
 
             self._debug(
                 f"batch_put: batch {batch_number} complete "
