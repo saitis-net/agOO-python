@@ -202,7 +202,7 @@ alt unarchiveAsked = false  (file not yet marked)
   note right of server
     unarchiveAsked = true.
     File still in cache (isOffline=false).
-    Displayed as ✗ (dim) in remote pane.
+    Displayed as ● (dim) in remote pane.
     Caller must run async_synchronize()
     to actually evict the file.
   end note

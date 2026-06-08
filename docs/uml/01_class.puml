@@ -113,7 +113,7 @@ note right of Agoo
     rename=false → COPY: sets unarchiveAsked=true.
     Dual role depending on current file state:
       isOffline=true  (archived) → schedules recall (file shows ↑)
-      isOffline=false (cached)   → marks for eviction (file shows ✗)
+      isOffline=false (cached)   → marks for eviction (file shows ●)
     Caller must call async_synchronize() to trigger the server job.
 
   temp_del(f)

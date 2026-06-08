@@ -26,8 +26,8 @@ Local pane
 
 Remote pane
 -----------
-  Bold   ● file is in temp (cache) — available for Download.
-  Dim    ✗ file is in cache but marked for eviction (unarchiveAsked).
+  Bold   ✗ file is in temp (cache) — available for Download.
+  Dim    ● file is in cache but marked for eviction (unarchiveAsked).
   Dim    ○ file is in archive — available for Retrieve.
   Italic ↑ archive recall in progress.
 
@@ -399,8 +399,8 @@ class RemotePane:
         server-reported file state:
 
           ``  ``  directory (bold)
-          ``● ``  cached / online   — isOffline=false, unarchiveAsked=false  (bold)
-          ``✗ ``  eviction-marked   — isOffline=false, unarchiveAsked=true   (dim)
+          ``✗ ``  cached / online   — isOffline=false, unarchiveAsked=false  (bold)
+          ``● ``  eviction-marked   — isOffline=false, unarchiveAsked=true   (dim)
           ``↑ ``  recall in progress — isOffline=true, unarchiveAsked=true   (italic)
           ``○ ``  archived / offline  — isOffline=true, unarchiveAsked=false  (dim)
         """
@@ -452,11 +452,11 @@ class RemotePane:
                 label     = display
                 attr      = italic_attr
             elif evicting:
-                indicator = "✗ "
+                indicator = "● "
                 label     = display
                 attr      = curses.A_DIM
             elif not is_offline:
-                indicator = "● "
+                indicator = "✗ "
                 label     = display
                 attr      = curses.A_BOLD
             else:

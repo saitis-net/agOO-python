@@ -114,8 +114,8 @@ note bottom of temp
   Subject to capacity limits (get_usage).
 
   Filebrowser remote-pane indicators:
-    ●  isOffline=false, unarchiveAsked=false  (cached, normal)
-    ✗  isOffline=false, unarchiveAsked=true   (cached, marked for eviction)
+    ✗  isOffline=false, unarchiveAsked=false  (cached, normal)
+    ●  isOffline=false, unarchiveAsked=true   (cached, marked for eviction)
     ↑  isOffline=true,  unarchiveAsked=true   (offline, recall in progress)
     ○  isOffline=true,  unarchiveAsked=false  (archived)
 end note
