@@ -1291,8 +1291,14 @@ class FileBrowser:
         self._set_status(f"Uploading {label}…", busy=True)
         self._draw_all()   # show overlay immediately before first file starts
 
+        # Tracks files confirmed uploaded by the progress callback so that
+        # an aborted upload can remove only the already-uploaded files from
+        # pending_uploads rather than leaving them in the queue.
+        uploaded: set[str] = set()
+
         def _on_progress(f: str, done: int, total: int,
                          bytes_done: int, bytes_total: int) -> None:
+            uploaded.add(f)
             self.msg_q.put(("upload_progress", {
                 "file": f, "done": done, "total": total,
                 "bytes_done": bytes_done, "bytes_total": bytes_total,
@@ -1305,6 +1311,9 @@ class FileBrowser:
                 self.pending_uploads.difference_update(paths)
                 self.msg_q.put(("done", f"Uploaded {label} successfully."))
             elif abort.is_set():
+                # Remove only the files that were confirmed uploaded before
+                # the abort so re-pressing 's' retries the remainder only.
+                self.pending_uploads.difference_update(uploaded)
                 self.msg_q.put(("error", "Upload aborted."))
             else:
                 self.msg_q.put(("error", self.client.error() or "upload failed"))
