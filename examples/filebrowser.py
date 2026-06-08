@@ -64,7 +64,6 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from agoo import Agoo
@@ -382,7 +381,8 @@ class RemotePane:
             is_offline = e.get("isOffline", False)
             api_path   = e.get("api_path", "")
             display    = e.get("display_name", e.get("name", ""))
-            pending    = e.get("unarchiveAsked", False) or api_path in self.pending_recalls
+            pending    = is_offline and (e.get("unarchiveAsked", False)
+                                         or api_path in self.pending_recalls)
 
             if is_dir:
                 indicator = "  "
@@ -912,7 +912,7 @@ class FileBrowser:
             elif choice == "Unmark (return to archive)":
                 self._do_unmark(api_path, display)
             elif choice == "Mark for retrieval":
-                self._do_recall(api_path, display)
+                self._do_mark(api_path, display)
             elif choice == "Delete from remote":
                 self._do_delete(api_path, display)
         elif pending:
@@ -1082,6 +1082,16 @@ class FileBrowser:
             self._draw_all()
         else:
             self._set_status(f"Unmark failed: {self.client.error()}")
+
+    def _do_mark(self, api_path: str, display: str) -> None:
+        """Mark a cached file for retrieval via schedule_unmigrate (sets unarchiveAsked)."""
+        ok = self.client.schedule_unmigrate(api_path)
+        if ok:
+            self._set_status(f"Marked: {display}  (marked for retrieval).")
+            self._remote_pane.refresh()
+            self._draw_all()
+        else:
+            self._set_status(f"Mark failed: {self.client.error()}")
 
     def _do_delete(self, api_path: str, display: str) -> None:
         """Permanently delete a file from remote storage (cache + archive)."""
