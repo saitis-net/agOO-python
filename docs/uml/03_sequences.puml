@@ -136,6 +136,11 @@ loop while pending files remain
 
     bp -> bp : files_done++\nbytes_done += size
     bp -> prog : progress(f, files_done,\ntotal_files, bytes_done, total_bytes)
+    note right of prog
+      Filebrowser overlay bar formula:
+      pct = 0.5 × (files_done / total_files)
+          + 0.5 × (bytes_done / total_bytes)
+    end note
     prog --> bp : (returns)
 
     bp -> abort : is_set()?
