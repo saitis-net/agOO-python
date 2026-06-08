@@ -26,8 +26,8 @@ Local pane
 
 Remote pane
 -----------
-  Bold   ✗ file is in temp (cache) — available for Download.
-  Dim    ● file is in cache but marked for eviction (unarchiveAsked).
+  Bold   ✗ file is in cache, marked for eviction (unarchiveAsked=false).
+  Dim    ● file is in cache, available — recalled from archive (unarchiveAsked=true).
   Dim    ○ file is in archive — available for Retrieve.
   Italic ↑ archive recall in progress.
 
@@ -399,10 +399,10 @@ class RemotePane:
         server-reported file state:
 
           ``  ``  directory (bold)
-          ``✗ ``  cached / online   — isOffline=false, unarchiveAsked=false  (bold)
-          ``● ``  eviction-marked   — isOffline=false, unarchiveAsked=true   (dim)
-          ``↑ ``  recall in progress — isOffline=true, unarchiveAsked=true   (italic)
-          ``○ ``  archived / offline  — isOffline=true, unarchiveAsked=false  (dim)
+          ``✗ ``  cached, eviction-marked — isOffline=false, unarchiveAsked=false (bold)
+          ``● ``  cached, available       — isOffline=false, unarchiveAsked=true  (dim)
+          ``↑ ``  recall in progress      — isOffline=true,  unarchiveAsked=true  (italic)
+          ``○ ``  archived                — isOffline=true,  unarchiveAsked=false (dim)
         """
         win = self.win
         h, w = win.getmaxyx()
@@ -441,7 +441,7 @@ class RemotePane:
             display    = e.get("display_name", e.get("name", ""))
             pending   = is_offline and (e.get("unarchiveAsked", False)
                                         or api_path in self.pending_recalls)
-            evicting  = (not is_offline) and e.get("unarchiveAsked", False)
+            recalled  = (not is_offline) and e.get("unarchiveAsked", False)
 
             if is_dir:
                 indicator = "  "
@@ -451,7 +451,7 @@ class RemotePane:
                 indicator = "↑ "
                 label     = display
                 attr      = italic_attr
-            elif evicting:
+            elif recalled:
                 indicator = "● "
                 label     = display
                 attr      = curses.A_DIM
