@@ -30,7 +30,8 @@ Remote pane
   Dim    ○ file is in archive — available for Retrieve.
   Italic ↑ archive recall in progress.
 
-  Enter  On a file (cache)   → Download / Unmark (return to archive) / Delete.
+  Enter  On a file (cache, unmarked) → Download / Mark for retrieval / Delete.
+         On a file (cache, marked)   → Download / Unmark (return to archive) / Delete.
          On a file (archive) → Retrieve from archive (triggers recall).
          On a file (pending) → status info only.
          On a folder         → Browse / Download folder / Mark for retrieval.
@@ -893,10 +894,16 @@ class FileBrowser:
             return
 
         if not is_offline:
-            # File is in cache — Download, Unmark (return to archive), and Delete.
+            # File is in cache.  If unarchiveAsked is True the file was
+            # explicitly recalled; offer to cancel that mark.  Otherwise
+            # offer to archive it ("Mark for retrieval") so it can be
+            # recalled later via schedule_unmigrate + async_synchronize.
+            unarchive_asked = e.get("unarchiveAsked", False)
+            archive_label = ("Unmark (return to archive)" if unarchive_asked
+                             else "Mark for retrieval")
             choice = show_menu(self.stdscr, f"● {display}",
                                ["Download to local",
-                                "Unmark (return to archive)",
+                                archive_label,
                                 "Delete from remote",
                                 "Cancel"])
             self._draw_all()
@@ -904,6 +911,8 @@ class FileBrowser:
                 self._do_download(api_path, display, local_dest)
             elif choice == "Unmark (return to archive)":
                 self._do_unmark(api_path, display)
+            elif choice == "Mark for retrieval":
+                self._do_recall(api_path, display)
             elif choice == "Delete from remote":
                 self._do_delete(api_path, display)
         elif pending:
