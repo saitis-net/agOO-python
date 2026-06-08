@@ -1462,24 +1462,32 @@ class Agoo:
     # Actions on archive storage (queued until async_synchronize() is called)
     # -------------------------------------------------------------------
 
-    def schedule_migrate(self, f: str) -> bool:
-        """Remove a file from temp (cache) storage, keeping the archive copy.
+    def schedule_migrate(self, f: str):
+        """Move a cached file back to archive storage (evict from cache).
 
-        Calls DELETE api/raw/<path> to discard the cached copy without
-        touching the archive.  After this call the file will appear as
-        isOffline=true in list_resources() and can be recalled with
-        schedule_unmigrate() if needed again.
+        Uses the same PATCH endpoint as schedule_unmigrate() but with
+        rename=true, which tells the server to move rather than copy:
+          PATCH /api/resources/<path>?action=copy&override=true&rename=true&...
 
-        Returns True on success, None on failure.
+        After this call the file will appear as isOffline=true in
+        list_resources() and can be recalled with schedule_unmigrate().
+
+        Returns the response object on success, None on failure.
         """
-        result = self._delete("api/raw/" + uri_escape(f))
-        return result is not None
+        return self._patch(
+            "api/resources/" + uri_escape(f)
+            + "?action=copy&override=true&rename=true&destination=/"
+            + uri_escape(f)
+        )
 
     def schedule_unmigrate(self, f: str):
-        """Schedule a copy of an archive file back to temp storage.
+        """Recall an archived file back to temp (cache) storage.
 
         Uses a PATCH action query-parameter to request a server-side copy:
-          PATCH /api/resources/<path>?action=copy&override=true&...
+          PATCH /api/resources/<path>?action=copy&override=true&rename=false&...
+
+        rename=false means copy (archive copy is preserved); the file
+        will appear as isOffline=false once the recall job completes.
 
         Returns the response object on success, None on failure.
         """
