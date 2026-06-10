@@ -885,7 +885,8 @@ class FileBrowser:
                 continue
 
             if key in (ord('q'), ord('Q')):
-                break
+                if self._confirm_quit():
+                    break
             elif key == curses.KEY_RESIZE:
                 self._init_layout()
                 self._draw_all()
@@ -1290,6 +1291,30 @@ class FileBrowser:
             self._draw_all()
         else:
             self._set_status(f"Delete failed: {self.client.error()}")
+
+    def _confirm_quit(self) -> bool:
+        """Return True if the application should exit now.
+
+        Quits immediately when nothing is pending.  When there are unsent
+        uploads or unfinished recalls the user is shown a confirmation menu
+        so they can cancel, trigger a sync, and then quit cleanly.
+
+        The busy-path emergency quit (q during an active upload) bypasses
+        this check intentionally — the user already has Ctrl-C for abort.
+        """
+        parts = []
+        n_up = len(self.pending_uploads)
+        n_rc = len(self.pending_recalls)
+        if n_up:
+            parts.append(f"{n_up} upload(s) pending")
+        if n_rc:
+            parts.append(f"{n_rc} recall(s) pending")
+        if not parts:
+            return True
+        choice = show_menu(self.stdscr, "  ·  ".join(parts),
+                           ["Quit anyway", "Cancel"])
+        self._draw_all()
+        return choice == "Quit anyway"
 
     def _trigger_sync(self) -> None:
         """Trigger an agOO archive sync from the remote pane ('s' key).
