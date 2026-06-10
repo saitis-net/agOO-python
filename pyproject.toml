@@ -5,12 +5,79 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "agoo"
 version = "0.1.0"
-description = "Python client for the agOO remote storage service"
+description = "Python client library for the agOO remote storage service"
+readme = "README.md"
 requires-python = ">=3.10"
 
-# Runtime dependency: the requests library replaces Perl's LWP::UserAgent.
-# All other dependencies (json, os, re, time, subprocess, pathlib, urllib.parse)
-# are part of the Python standard library.
+# Runtime dependency: the requests library is the only third-party import.
+# Everything else (json, os, re, curses, threading, pathlib, queue, …) is
+# part of the Python standard library.
 dependencies = [
     "requests>=2.28",
+]
+
+# ---------------------------------------------------------------------------
+# Optional dependency groups
+#
+# These are NOT installed automatically.  Install a group with:
+#   pip install "agoo[tui]"          # just the TUI extra
+#   pip install "agoo[build-binary]" # tools needed to build the static binary
+# ---------------------------------------------------------------------------
+
+[project.optional-dependencies]
+
+# TUI file-browser (tools/filebrowser.py).
+# The TUI itself uses only stdlib + the agoo library, so the only extra
+# needed on top of the base install is an explicit curses dependency hint
+# for packagers (curses ships with CPython on Linux but not on Windows).
+tui = []
+
+# Tools required to build the Python wheel and source distribution (step 01).
+# Usage: pip install "agoo[build-wheel]" && python -m build
+build-wheel = [
+    "build>=1.0",
+]
+
+# Tools required to build fully-static platform binaries (steps 02 & 03).
+#
+# Architecture notes:
+#   aarch64 (native):  all packages below are needed; scons compiles the
+#                      staticx ELF bootloader from C source because no
+#                      pre-built aarch64 wheel exists for staticx.
+#   x86_64  (native):  staticx, patchelf ship pre-built wheels; scons is
+#                      NOT needed; install with --only-binary=:all: staticx.
+#   cross-compilation: the build scripts handle tool selection automatically;
+#                      see build/02-bin-aarch64.sh and build/03-bin-amd64.sh.
+#
+# External tools (not pip-installable) also required:
+#   step 02 cross (x86_64→aarch64): sudo apt install qemu-user-static
+#                                    sudo apt install gcc-aarch64-linux-gnu
+#   step 03 cross (aarch64→amd64):  box64 — https://github.com/ptitSeb/box64
+#
+# patchelf 0.17 has an assertion-failure bug on PyInstaller output ELFs;
+# the build scripts pin patchelf==0.14.5.0 to work around this.
+build-binary = [
+    "pyinstaller>=6.0",
+    "staticx",
+    "scons",
+    "patchelf==0.14.5.0",
+    "setuptools>=68",      # staticx setup.py requires setuptools at build time
+]
+
+# Tools required to build the man pages from RST source (step 04).
+#
+# rst2man is provided by the python3-docutils system package, not by a pip
+# package.  Install it with:
+#   sudo apt install python3-docutils   # Debian / Ubuntu / Raspberry Pi OS
+#   sudo dnf install python3-docutils   # Fedora / RHEL
+#   brew install docutils               # macOS
+#
+# This group is intentionally left empty; it exists as documentation only.
+build-docs = []
+
+# Everything needed to build all distribution artefacts locally.
+# Excludes external tools that cannot be expressed as pip packages
+# (qemu-user-static, gcc-aarch64-linux-gnu, box64, python3-docutils).
+build = [
+    "agoo[build-wheel,build-binary]",
 ]

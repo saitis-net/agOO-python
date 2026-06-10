@@ -87,6 +87,20 @@ def _fmt_size(n: int) -> str:
     return f"{n} B"
 
 
+def _sanitize(s: str) -> str:
+    """Replace control characters in *s* with '?'.
+
+    Prevents server-supplied strings (filenames, error messages) that contain
+    ANSI escape sequences, embedded newlines, or null bytes from corrupting
+    curses rendering or injecting terminal control sequences.
+
+    str.isprintable() returns False for all C0/C1 control characters
+    (U+0000–U+001F, U+007F–U+009F) as well as Unicode separators, so it
+    covers the full range of characters that curses should never receive.
+    """
+    return "".join(c if c.isprintable() else "?" for c in s)
+
+
 # ── Local pane ─────────────────────────────────────────────────────────────────
 
 @dataclass
@@ -302,7 +316,7 @@ class RemotePane:
         self.error = None
         raw = self.client.list_resources(self.remote_path)
         if raw is None:
-            self.error = self.client.error() or "listing failed"
+            self.error = _sanitize(self.client.error() or "listing failed")
             self.entries = []
             return
         self._build(raw)
@@ -326,7 +340,7 @@ class RemotePane:
             if name in _HIDDEN_NAMES:
                 continue
             api_path = item.get("path", "").lstrip("/")  # Agoo API uses relative paths
-            result.append({**item, "display_name": name, "api_path": api_path})
+            result.append({**item, "display_name": _sanitize(name), "api_path": api_path})
 
         result.sort(key=lambda e: (not e.get("isDir", False),
                                    e.get("display_name", "").lower()))
@@ -867,11 +881,23 @@ class FileBrowser:
                         self._set_status(
                             "Aborting… waiting for current file to finish", busy=True)
                 elif key in (ord('q'), ord('Q')):
-                    break
+                    p = self._upload_progress
+                    if p:
+                        title = f"Uploading {p['done']}/{p['total']} files — abort and quit?"
+                    else:
+                        title = "Operation in progress — abort and quit?"
+                    choice = show_menu(self.stdscr, title,
+                                       ["Abort and quit", "Cancel"])
+                    self._draw_all()
+                    if choice == "Abort and quit":
+                        if self._upload_abort is not None:
+                            self._upload_abort.set()
+                        break
                 continue
 
             if key in (ord('q'), ord('Q')):
-                break
+                if self._confirm_quit():
+                    break
             elif key == curses.KEY_RESIZE:
                 self._init_layout()
                 self._draw_all()
@@ -1088,8 +1114,16 @@ class FileBrowser:
 
     # ── Local folder marking ───────────────────────────────────────────────────
 
-    def _collect_local_files(self, path: Path) -> list[str]:
-        """Recursively collect all non-hidden files under path."""
+    def _collect_local_files(self, path: Path,
+                              _visited: set[str] | None = None) -> list[str]:
+        """Recursively collect all non-hidden files under path.
+
+        Symlinks to files are included normally.  Symlinks to directories are
+        followed unless doing so would create a traversal loop, detected by
+        tracking the resolved real path of every directory entered.
+        """
+        if _visited is None:
+            _visited = {str(path.resolve())}
         result: list[str] = []
         try:
             for item in sorted(path.iterdir()):
@@ -1098,7 +1132,14 @@ class FileBrowser:
                 if item.is_file():
                     result.append(str(item))
                 elif item.is_dir():
-                    result.extend(self._collect_local_files(item))
+                    try:
+                        real = str(item.resolve())
+                    except OSError:
+                        continue
+                    if real in _visited:
+                        continue  # loop — this real path is already an ancestor
+                    _visited.add(real)
+                    result.extend(self._collect_local_files(item, _visited))
         except PermissionError:
             pass
         return result
@@ -1261,6 +1302,30 @@ class FileBrowser:
             self._draw_all()
         else:
             self._set_status(f"Delete failed: {self.client.error()}")
+
+    def _confirm_quit(self) -> bool:
+        """Return True if the application should exit now.
+
+        Quits immediately when nothing is pending.  When there are unsent
+        uploads or unfinished recalls the user is shown a confirmation menu
+        so they can cancel, trigger a sync, and then quit cleanly.
+
+        The busy-path emergency quit (q during an active upload) bypasses
+        this check intentionally — the user already has Ctrl-C for abort.
+        """
+        parts = []
+        n_up = len(self.pending_uploads)
+        n_rc = len(self.pending_recalls)
+        if n_up:
+            parts.append(f"{n_up} upload(s) pending")
+        if n_rc:
+            parts.append(f"{n_rc} recall(s) pending")
+        if not parts:
+            return True
+        choice = show_menu(self.stdscr, "  ·  ".join(parts),
+                           ["Quit anyway", "Cancel"])
+        self._draw_all()
+        return choice == "Quit anyway"
 
     def _trigger_sync(self) -> None:
         """Trigger an agOO archive sync from the remote pane ('s' key).

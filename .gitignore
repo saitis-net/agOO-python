@@ -4,6 +4,8 @@ __pycache__/
 *.egg-info/
 dist/
 build/
+!build/
+!build/*.sh
 .eggs/
 *.log
 *.egg
