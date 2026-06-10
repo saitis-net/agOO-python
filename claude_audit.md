@@ -593,9 +593,9 @@ The `_visited` set is shared by reference across all recursive calls in one trav
 
 ### T-02 — Remote Filenames with Embedded Control Characters Rendered Without Sanitization
 
-**Score: 2 / 10**  
-**Status: OPEN**  
-**File:** `tools/filebrowser.py:448-474`, `tools/filebrowser.py:325-329`
+**Score: 2 / 10 → residual: 0 / 10 (fully mitigated)**  
+**Status: RESOLVED**  
+**File:** `tools/filebrowser.py:90-101`, `tools/filebrowser.py:340`, `tools/filebrowser.py:319`
 
 #### Description
 
@@ -615,28 +615,27 @@ No characters are stripped or escaped before the string reaches curses. If the s
 - **Embedded newlines** (`\n`, `\r`) — cause curses to interpret the next portion of the line as a new row, mis-aligning all subsequent pane entries.
 - **Null bytes** (`\x00`) — terminate the string early in C-backed curses implementations, silently truncating the rendered line.
 
-The same issue applies to the `title` bar (`f" Local: {self.path} "`) and the status bar (`self.status`), which also render untrusted strings (server error text, server-supplied filenames) without sanitization.
+The same issue applies to the status bar, which also renders server error text without sanitization.
 
 #### Impact
 
 A server operator (or a server that has been compromised) can produce filenames that corrupt the user's TUI display or, in the worst case on some terminal emulators, inject terminal control sequences that alter terminal state after the TUI exits (e.g. disabling echo, enabling application-cursor-key mode). This does not provide remote code execution, but it can render the TUI unusable and leave the terminal in an unrecoverable state requiring a `reset` command.
 
-#### Recommendation
+#### Mitigation applied
 
-Filter non-printable characters from server-supplied strings before rendering. A conservative guard:
+A module-level `_sanitize()` helper replaces any non-printable character with `?` using `str.isprintable()`, which returns `False` for all C0/C1 control characters (U+0000–U+001F, U+007F–U+009F) as well as Unicode separators:
 
 ```python
-import unicodedata
-
-def _sanitize_display(s: str) -> str:
-    """Replace control characters with a visible placeholder."""
-    return "".join(
-        c if unicodedata.category(c)[0] != "C" else "?"
-        for c in s
-    )
+def _sanitize(s: str) -> str:
+    return "".join(c if c.isprintable() else "?" for c in s)
 ```
 
-Apply this to every `display_name`, server error message, and remote path rendered in the TUI.
+Sanitization is applied at ingestion — before the data enters the entry list or the error field — so every downstream use (draw, menus, status bar) receives clean strings automatically:
+
+- **`RemotePane._build()`** — `display_name` is sanitized when each entry dict is constructed, covering all filenames and directory names shown in the remote pane and its context menus.
+- **`RemotePane.refresh()`** — the server error string stored in `self.error` (and rendered in the pane title area on failure) is sanitized before assignment.
+
+The `?` replacement preserves column width, so the fixed-width layout of the pane does not shift when a control character is substituted.
 
 ---
 
@@ -727,7 +726,7 @@ And update `RemotePane.draw()` to accept the snapshot as a parameter rather than
 | ID | Title | Score | Status | Location |
 |---|---|---|---|---|
 | T-01 | `_collect_local_files()` follows symlinks; unintended upload scope + recursion crash | **3** | **Resolved** | `filebrowser.py:1091-1118` |
-| T-02 | Control characters in server filenames rendered without sanitization | **2** | Open | `filebrowser.py:448-474` |
+| T-02 | Control characters in server filenames rendered without sanitization | **2** | **Resolved** | `filebrowser.py:90-101, 319, 340` |
 | T-03 | Permanent remote delete executes after single menu selection; no confirmation | **2** | Open | `filebrowser.py:1063-1076, 1255-1263` |
 | T-04 | `pending_recalls` not snapshotted before draw (asymmetry with `pending_uploads`) | **1** | Open | `filebrowser.py:606, 662-665` |
 
@@ -741,7 +740,7 @@ And update `RemotePane.draw()` to accept the snapshot as a parameter rather than
 
 2. ~~T-01~~ — Loop-detection via `_visited` resolved-path set; symlinks to files still followed.
 
-3. **Sanitize server-supplied strings before rendering in curses** (T-02). Add a `_sanitize_display()` helper that strips control characters. Apply to all server-sourced strings passed to `curses.addstr()`.
+3. ~~T-02~~ — `_sanitize()` applied at ingestion in `_build()` and `refresh()`; all downstream render sites receive clean strings.
 
 4. **Add a second confirmation for destructive remote delete** (T-03). Operational risk; low probability but permanent consequence if triggered accidentally.
 

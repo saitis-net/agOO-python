@@ -87,6 +87,20 @@ def _fmt_size(n: int) -> str:
     return f"{n} B"
 
 
+def _sanitize(s: str) -> str:
+    """Replace control characters in *s* with '?'.
+
+    Prevents server-supplied strings (filenames, error messages) that contain
+    ANSI escape sequences, embedded newlines, or null bytes from corrupting
+    curses rendering or injecting terminal control sequences.
+
+    str.isprintable() returns False for all C0/C1 control characters
+    (U+0000–U+001F, U+007F–U+009F) as well as Unicode separators, so it
+    covers the full range of characters that curses should never receive.
+    """
+    return "".join(c if c.isprintable() else "?" for c in s)
+
+
 # ── Local pane ─────────────────────────────────────────────────────────────────
 
 @dataclass
@@ -302,7 +316,7 @@ class RemotePane:
         self.error = None
         raw = self.client.list_resources(self.remote_path)
         if raw is None:
-            self.error = self.client.error() or "listing failed"
+            self.error = _sanitize(self.client.error() or "listing failed")
             self.entries = []
             return
         self._build(raw)
@@ -326,7 +340,7 @@ class RemotePane:
             if name in _HIDDEN_NAMES:
                 continue
             api_path = item.get("path", "").lstrip("/")  # Agoo API uses relative paths
-            result.append({**item, "display_name": name, "api_path": api_path})
+            result.append({**item, "display_name": _sanitize(name), "api_path": api_path})
 
         result.sort(key=lambda e: (not e.get("isDir", False),
                                    e.get("display_name", "").lower()))
