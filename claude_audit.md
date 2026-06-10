@@ -1,9 +1,9 @@
 # Security Audit — agOO-python
 
 **Audit date:** 2026-06-02  
-**Last updated:** 2026-06-03 (mitigations F-01–F-11; dev-branch review D-01–D-04)  
+**Last updated:** 2026-06-10 (TUI tool review T-01–T-04)  
 **Auditor:** Claude Sonnet 4.6  
-**Scope:** All source files in the repository (`agoo/`, `scripts/`)  
+**Scope:** All source files in the repository (`agoo/`, `scripts/`, `tools/`)  
 **Methodology:** Static analysis — full manual code review of every source file
 
 ---
@@ -511,11 +511,241 @@ python scripts/upload.py --force eos/*.swi
 
 ---
 
+---
+
+## TUI Tool Review — `tools/filebrowser.py`
+
+**Scope:** `tools/filebrowser.py` only  
+**Review date:** 2026-06-10  
+**Methodology:** Full manual static analysis
+
+---
+
+### T-01 — `_collect_local_files()` Follows Symlinks, Enabling Upload Scope Escape
+
+**Score: 3 / 10 → residual: 0 / 10 (fully mitigated)**  
+**Status: RESOLVED**  
+**File:** `tools/filebrowser.py:1091-1118`
+
+#### Description
+
+`_collect_local_files()` recurses into any entry for which `item.is_dir()` returns `True`. On POSIX, `Path.is_dir()` follows symlinks, so a symlink to a directory resolves as a directory and the method descends into it. Likewise, `item.is_file()` is `True` for a symlink to a file, so symlinked files are also added to the upload queue.
+
+```python
+# before
+for item in sorted(path.iterdir()):
+    if item.name.startswith("."):
+        continue
+    if item.is_file():
+        result.append(str(item))   # symlinks to files included
+    elif item.is_dir():
+        result.extend(self._collect_local_files(item))  # follows symlinks to dirs
+```
+
+Two concrete risks follow:
+
+1. **Unintended upload scope.** If a symlink inside the browsed tree points to a directory that lives outside it (e.g. `/home/user/project/data → /mnt/nas/sensitive`), pressing "Mark folder for upload" uploads every file under `/mnt/nas/sensitive` without the user seeing those paths in the pane.
+
+2. **Infinite recursion / crash.** A symlink loop (e.g. `a → .` or `a/b → ../a`) causes unbounded recursion. Python's default recursion limit (1000 frames) will eventually raise `RecursionError`, crashing the TUI and leaving the terminal in raw-curses mode until the exception propagates through `curses.wrapper()`.
+
+#### Impact
+
+An attacker who can plant a symlink in a directory that the user browses with the TUI can arrange for files from outside the expected tree to be uploaded to the remote server. On shared systems (CI build directories, multi-user NAS mounts) this is a plausible attack surface.
+
+The `RecursionError` path is a reliable crash trigger requiring only local write access to any directory the user marks for upload.
+
+#### Mitigation applied
+
+Rather than refusing all symlinks, the fix tracks which real (resolved) directory paths have already been entered during a single traversal. Before recursing into any directory entry — whether a real directory or a symlink to one — its canonical on-disk path is computed via `Path.resolve()`. If that path already appears in the `_visited` set, it is a loop ancestor and the entry is skipped. Otherwise, the path is recorded and the descent proceeds normally.
+
+Symlinks to **files** are unaffected: `is_file()` follows the link and the file is queued as before.
+
+```python
+# after
+def _collect_local_files(self, path: Path,
+                          _visited: set[str] | None = None) -> list[str]:
+    if _visited is None:
+        _visited = {str(path.resolve())}
+    result: list[str] = []
+    try:
+        for item in sorted(path.iterdir()):
+            if item.name.startswith("."):
+                continue
+            if item.is_file():
+                result.append(str(item))
+            elif item.is_dir():
+                try:
+                    real = str(item.resolve())
+                except OSError:
+                    continue
+                if real in _visited:
+                    continue  # loop — this real path is already an ancestor
+                _visited.add(real)
+                result.extend(self._collect_local_files(item, _visited))
+    except PermissionError:
+        pass
+    return result
+```
+
+The `_visited` set is shared by reference across all recursive calls in one traversal, so a directory reachable via two different symlinks (diamond topology) is also correctly deduplicated. The `OSError` guard on `resolve()` handles the rare case where intermediate path components are inaccessible.
+
+---
+
+### T-02 — Remote Filenames with Embedded Control Characters Rendered Without Sanitization
+
+**Score: 2 / 10**  
+**Status: OPEN**  
+**File:** `tools/filebrowser.py:448-474`, `tools/filebrowser.py:325-329`
+
+#### Description
+
+The remote pane builds each display line by truncating the server-supplied `display_name` field to `name_w` characters and passing the result directly to `curses.addstr()`:
+
+```python
+display = e.get("display_name", e.get("name", ""))
+...
+label = display + "/"          # or just display for files
+line  = "  " + indicator + label[:name_w].ljust(name_w) + " " + size_s.rjust(size_w)
+win.addstr(row, 1, line[:w - 2], attr)
+```
+
+No characters are stripped or escaped before the string reaches curses. If the server returns a filename that contains:
+
+- **ANSI escape sequences** (e.g. `\x1b[2J`) — most curses builds pass these through to the underlying terminal driver, potentially clearing the screen or altering terminal mode.
+- **Embedded newlines** (`\n`, `\r`) — cause curses to interpret the next portion of the line as a new row, mis-aligning all subsequent pane entries.
+- **Null bytes** (`\x00`) — terminate the string early in C-backed curses implementations, silently truncating the rendered line.
+
+The same issue applies to the `title` bar (`f" Local: {self.path} "`) and the status bar (`self.status`), which also render untrusted strings (server error text, server-supplied filenames) without sanitization.
+
+#### Impact
+
+A server operator (or a server that has been compromised) can produce filenames that corrupt the user's TUI display or, in the worst case on some terminal emulators, inject terminal control sequences that alter terminal state after the TUI exits (e.g. disabling echo, enabling application-cursor-key mode). This does not provide remote code execution, but it can render the TUI unusable and leave the terminal in an unrecoverable state requiring a `reset` command.
+
+#### Recommendation
+
+Filter non-printable characters from server-supplied strings before rendering. A conservative guard:
+
+```python
+import unicodedata
+
+def _sanitize_display(s: str) -> str:
+    """Replace control characters with a visible placeholder."""
+    return "".join(
+        c if unicodedata.category(c)[0] != "C" else "?"
+        for c in s
+    )
+```
+
+Apply this to every `display_name`, server error message, and remote path rendered in the TUI.
+
+---
+
+### T-03 — Permanent Remote Delete Has No Confirmation Step
+
+**Score: 2 / 10**  
+**Status: OPEN**  
+**File:** `tools/filebrowser.py:1063-1076`, `tools/filebrowser.py:1255-1263`
+
+#### Description
+
+`_do_delete()` calls `client.temp_del()` immediately after a single menu selection with no secondary confirmation:
+
+```python
+# _handle_remote_enter() — user selects "Delete from remote":
+elif choice == "Delete from remote":
+    self._do_delete(api_path, display)
+
+# _do_delete():
+def _do_delete(self, api_path: str, display: str) -> None:
+    result = self.client.temp_del(api_path)
+    ...
+```
+
+`temp_del()` sends `DELETE api/resources/<path>`, which removes the cached copy of the file. In practice, a file that has been migrated to archive is not deleted from archive by this call (the archive copy survives), but the UX provides no feedback distinguishing "cache copy deleted, archive intact" from "all copies deleted." A user who navigates the menu quickly — especially when keyboard-repeating through entries — can accidentally delete files they intended to keep.
+
+Additionally, D-04 (no `--force` confirmation in `upload.py`) applies symmetrically here: accidental mass-delete via repeated Enter presses.
+
+#### Impact
+
+Unintentional data loss from the cache tier. Archive data is preserved (the `temp_del` API is documented as cache-only), but the operator must know to trigger a recall to recover it. If archive copies have not been created yet (e.g. sync has not run since upload), the delete is permanent.
+
+#### Recommendation
+
+Insert a second confirmation menu before executing the delete, showing the full remote path and explicitly stating what will be deleted:
+
+```python
+confirm = show_menu(
+    self.stdscr,
+    f"Delete '{display}'?",
+    [f"Confirm delete", "Cancel"],
+)
+if confirm == "Confirm delete":
+    self._do_delete(api_path, display)
+```
+
+---
+
+### T-04 — `pending_recalls` Passed by Reference to `RemotePane`; Not Snapshotted Before Draw
+
+**Score: 1 / 10**  
+**Status: OPEN**  
+**File:** `tools/filebrowser.py:606`, `tools/filebrowser.py:662-665`, `tools/filebrowser.py:898-905`
+
+#### Description
+
+`pending_uploads` is snapshotted to an immutable `frozenset` immediately before each `LocalPane.draw()` call, guarding against concurrent mutation by the upload worker thread:
+
+```python
+self._local_pane.draw(self.active == 0, 1,
+                      frozenset(self.pending_uploads), 3,    # snapshotted
+                      frozenset(self.pending_upload_folders), 4)
+```
+
+`pending_recalls` is not snapshotted. `RemotePane` holds a reference to the live `set` object and reads it in `draw()` (line 444: `api_path in self.pending_recalls`). The main event loop clears it via `self.pending_recalls.clear()` (line 904), and background recall threads call `self.pending_recalls.discard(api_path)` and `self.pending_recalls.add(api_path)` concurrently.
+
+In CPython, individual `set` method calls (`add`, `discard`, `clear`, `in`) are protected by the GIL, so the structure will not be corrupted. However, `set.clear()` followed immediately by a draw tick can cause a file that was showing as "↑ recall in progress" to flicker to "○ archived" for one frame and then back — a benign but confusing visual artefact.
+
+#### Impact
+
+No data loss or security consequence. Cosmetic inconsistency: a file may momentarily display the wrong recall indicator. Low severity; flagged for completeness and because it is an asymmetry relative to the snapshotted handling of `pending_uploads`.
+
+#### Recommendation
+
+Apply the same snapshot pattern for consistency:
+
+```python
+self._remote_pane.draw(self.active == 1, 1, self._italic,
+                       frozenset(self.pending_recalls))
+```
+
+And update `RemotePane.draw()` to accept the snapshot as a parameter rather than reading from `self.pending_recalls` directly.
+
+---
+
+## TUI Tool Summary Table
+
+| ID | Title | Score | Status | Location |
+|---|---|---|---|---|
+| T-01 | `_collect_local_files()` follows symlinks; unintended upload scope + recursion crash | **3** | **Resolved** | `filebrowser.py:1091-1118` |
+| T-02 | Control characters in server filenames rendered without sanitization | **2** | Open | `filebrowser.py:448-474` |
+| T-03 | Permanent remote delete executes after single menu selection; no confirmation | **2** | Open | `filebrowser.py:1063-1076, 1255-1263` |
+| T-04 | `pending_recalls` not snapshotted before draw (asymmetry with `pending_uploads`) | **1** | Open | `filebrowser.py:606, 662-665` |
+
+---
+
 ## Recommended Priority Order
 
-### Remaining open items (as of 2026-06-03)
+### Remaining open items (as of 2026-06-10)
 
 1. **Rotate the agOO password and rewrite git history** (F-01 residual). Source code is clean, but `git log -p` on any clone made before `c7a2feb` still reveals the plaintext password. Use `git filter-repo --replace-text` and force-push (or re-create) the repository.
+
+2. ~~T-01~~ — Loop-detection via `_visited` resolved-path set; symlinks to files still followed.
+
+3. **Sanitize server-supplied strings before rendering in curses** (T-02). Add a `_sanitize_display()` helper that strips control characters. Apply to all server-sourced strings passed to `curses.addstr()`.
+
+4. **Add a second confirmation for destructive remote delete** (T-03). Operational risk; low probability but permanent consequence if triggered accidentally.
+
+5. **Snapshot `pending_recalls` before draw** (T-04). Cosmetic consistency fix; no urgency.
 
 ### Resolved / closed
 - ~~F-02~~ — `_SafeSession` strips `X-Auth` on cross-origin redirects.

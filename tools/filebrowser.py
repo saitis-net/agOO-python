@@ -1088,8 +1088,16 @@ class FileBrowser:
 
     # ── Local folder marking ───────────────────────────────────────────────────
 
-    def _collect_local_files(self, path: Path) -> list[str]:
-        """Recursively collect all non-hidden files under path."""
+    def _collect_local_files(self, path: Path,
+                              _visited: set[str] | None = None) -> list[str]:
+        """Recursively collect all non-hidden files under path.
+
+        Symlinks to files are included normally.  Symlinks to directories are
+        followed unless doing so would create a traversal loop, detected by
+        tracking the resolved real path of every directory entered.
+        """
+        if _visited is None:
+            _visited = {str(path.resolve())}
         result: list[str] = []
         try:
             for item in sorted(path.iterdir()):
@@ -1098,7 +1106,14 @@ class FileBrowser:
                 if item.is_file():
                     result.append(str(item))
                 elif item.is_dir():
-                    result.extend(self._collect_local_files(item))
+                    try:
+                        real = str(item.resolve())
+                    except OSError:
+                        continue
+                    if real in _visited:
+                        continue  # loop — this real path is already an ancestor
+                    _visited.add(real)
+                    result.extend(self._collect_local_files(item, _visited))
         except PermissionError:
             pass
         return result
