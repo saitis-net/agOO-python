@@ -881,7 +881,18 @@ class FileBrowser:
                         self._set_status(
                             "Aborting… waiting for current file to finish", busy=True)
                 elif key in (ord('q'), ord('Q')):
-                    break
+                    p = self._upload_progress
+                    if p:
+                        title = f"Uploading {p['done']}/{p['total']} files — abort and quit?"
+                    else:
+                        title = "Operation in progress — abort and quit?"
+                    choice = show_menu(self.stdscr, title,
+                                       ["Abort and quit", "Cancel"])
+                    self._draw_all()
+                    if choice == "Abort and quit":
+                        if self._upload_abort is not None:
+                            self._upload_abort.set()
+                        break
                 continue
 
             if key in (ord('q'), ord('Q')):
