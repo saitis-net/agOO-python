@@ -12,20 +12,37 @@
 #
 # Usage:
 #   ./build/build.sh                       Run all steps
-#   ./build/build.sh wheel                 Step 01 only: Python wheel + sdist
-#   ./build/build.sh aarch64               Step 02 only: static aarch64 binary
-#   ./build/build.sh amd64                 Step 03 only: static amd64 binary (box64)
-#   ./build/build.sh docs                  Step 04 only: man pages
-#   ./build/build.sh installer             Step 05 only: self-extracting installer
+#   ./build/build.sh wheel                 Step 01: Python wheel + sdist
+#   ./build/build.sh aarch64               Step 02: static aarch64 binary
+#   ./build/build.sh amd64                 Step 03: static amd64 binary
+#   ./build/build.sh docs                  Step 04: man pages
+#   ./build/build.sh installer             Step 05: self-extracting installer
 #   ./build/build.sh wheel docs installer  Run selected steps in order
 #
-# Environment:
-#   AMD64_PYTHON_TAR_URL   Override the auto-detected python-build-standalone URL
-#                          for the amd64 cross-build step.
+# Architecture support (steps 02 and 03):
+#   Both steps run on both aarch64 and x86_64 hosts:
 #
-# Steps 02 and 03 require significant disk space (~500 MB each for the venv +
-# PyInstaller build cache). Step 03 is slow under box64 emulation (typically
-# 5–15 minutes on a Raspberry Pi 4/5).
+#   On aarch64 host:
+#     step 02 (aarch64): native build
+#     step 03 (amd64):   cross-build via box64 — requires box64 in PATH
+#
+#   On x86_64 host:
+#     step 02 (aarch64): cross-build via qemu-aarch64-static
+#                        requires: sudo apt install qemu-user-static
+#                        for fully-static output: sudo apt install gcc-aarch64-linux-gnu
+#     step 03 (amd64):   native build
+#
+#   If a required cross-build tool is missing the step exits with code 3
+#   (shown as "skipped" in the summary rather than "failed").
+#
+# Environment:
+#   AARCH64_PYTHON_TAR_URL  Override auto-detected python-build-standalone URL (step 02)
+#   AMD64_PYTHON_TAR_URL    Override auto-detected python-build-standalone URL (step 03)
+#
+# Disk/time notes:
+#   Cross-build steps download ~60 MB of CPython and use ~500 MB of build cache.
+#   PyInstaller under emulation (box64 or QEMU) typically takes 5–15 minutes
+#   on a Raspberry Pi 4/5 or a similarly-clocked machine.
 
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -49,19 +66,23 @@ _elapsed() {
     printf '%dm%02ds' $((s/60)) $((s%60))
 }
 
+# Run one step script; returns 0 (success), 3 (skipped), or 1+ (failed).
+# Exit code 3 from a step means "prerequisite not available, step voluntarily
+# skipped" — build.sh shows it as skipped, not failed, and continues.
 _run_step() {
     local name="$1" script="$2"
-    local t0; t0=$(date +%s)
+    local t0 rc
+    t0=$(date +%s)
     printf "\n${C_BOLD}━━━ Step: %-12s ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${C_RESET}\n" "$name"
-    if bash "$script"; then
-        local t1; t1=$(date +%s)
-        _ok "$name completed in $(_elapsed $((t1-t0)))"
-        return 0
-    else
-        local rc=$?
-        _err "$name FAILED (exit $rc)"
-        return $rc
-    fi
+    rc=0
+    bash "$script" || rc=$?
+    local t1; t1=$(date +%s)
+    case $rc in
+        0) _ok  "$name completed in $(_elapsed $((t1-t0)))" ;;
+        3) _warn "$name skipped (prerequisite not available — see output above)" ;;
+        *) _err  "$name FAILED (exit $rc)" ;;
+    esac
+    return $rc
 }
 
 # ---------------------------------------------------------------------------
@@ -99,10 +120,12 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# Pre-flight checks
+# Pre-flight
 # ---------------------------------------------------------------------------
+_log "Host architecture: $(uname -m)"
 _log "Working directory: $(pwd)"
 _log "Steps to run: ${SELECTED[*]}"
+
 VERSION=$(python3 -c "
 import tomllib, pathlib
 with open('pyproject.toml','rb') as f:
@@ -127,20 +150,14 @@ SKIPPED=()
 
 for step in "${SELECTED[@]}"; do
     script="$SCRIPT_DIR/${STEP_MAP[$step]}"
-
-    # Skip the aarch64 binary step if not on aarch64.
-    if [ "$step" = "aarch64" ] && [ "$(uname -m)" != "aarch64" ]; then
-        _warn "Skipping aarch64: not on an aarch64 host ($(uname -m))"
-        SKIPPED+=("$step")
-        continue
-    fi
-
-    if _run_step "$step" "$script"; then
-        :
-    else
-        FAILED+=("$step")
-        _warn "Continuing with remaining steps despite failure in '$step'"
-    fi
+    rc=0
+    _run_step "$step" "$script" || rc=$?
+    case $rc in
+        0) ;;
+        3) SKIPPED+=("$step") ;;
+        *) FAILED+=("$step")
+           _warn "Continuing with remaining steps" ;;
+    esac
 done
 
 # ---------------------------------------------------------------------------
@@ -166,7 +183,7 @@ _list_if_exists "dist/man/man3/agoo.3.gz"
 _list_if_exists "dist/install-agOO-client-TUI.sh"
 
 if [ ${#SKIPPED[@]} -ne 0 ]; then
-    printf "\n  ${C_YELLOW}skipped: %s${C_RESET}\n" "${SKIPPED[*]}"
+    printf "\n  ${C_YELLOW}skipped (prerequisite missing): %s${C_RESET}\n" "${SKIPPED[*]}"
 fi
 
 if [ ${#FAILED[@]} -ne 0 ]; then
@@ -174,4 +191,8 @@ if [ ${#FAILED[@]} -ne 0 ]; then
     exit 1
 fi
 
-printf "\n${C_GREEN}All selected steps completed successfully.${C_RESET}\n"
+if [ ${#SKIPPED[@]} -ne 0 ] && [ ${#FAILED[@]} -eq 0 ]; then
+    printf "\n${C_YELLOW}Completed with skipped steps (see above for missing prerequisites).${C_RESET}\n"
+else
+    printf "\n${C_GREEN}All selected steps completed successfully.${C_RESET}\n"
+fi
