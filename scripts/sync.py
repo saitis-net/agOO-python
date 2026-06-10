@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026  Thomas Gruet <thomas.gruet@saitis.net>
 """sync.py — Trigger an async archive sync on the agOO service and wait for it.
 
 Usage
