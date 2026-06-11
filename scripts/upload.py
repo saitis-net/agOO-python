@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
-# Copyright (C) 2026  Thomas Gruet <thomas.gruet@saitis.net>
+# Copyright (C) 2026  Saitis Sàrl
 """upload.py — Upload one or more local files to agOO temp or archive storage.
 
 Overview

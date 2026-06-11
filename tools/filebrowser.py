@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
-# Copyright (C) 2026  Thomas Gruet <thomas.gruet@saitis.net>
+# Copyright (C) 2026  Saitis Sàrl
 """tools/filebrowser.py — Interactive split-pane TUI for agOO storage.
 
 Layout
