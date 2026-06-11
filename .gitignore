@@ -10,3 +10,4 @@ build/
 *.log
 *.egg
 .env
+CONTRIBUTOR_COPYRIGHT_ASSIGNMENT.md
