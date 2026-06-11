@@ -5,14 +5,16 @@
 # archive containing:
 #   agOO-client-TUI.aarch64          — static aarch64 binary
 #   agOO-client-TUI.amd64            — static amd64 binary
+#   agoo-*.whl                       — Python wheel (agoo library)
 #   man/man1/agOO-client-TUI.1.gz    — TUI man page
 #   man/man3/agoo.3.gz               — library man page
 #
 # When executed, the installer:
 #   1. Detects the host architecture.
 #   2. Extracts the matching binary to PREFIX/bin/agOO-client-TUI.
-#   3. Installs the man pages to PREFIX/share/man/.
-#   4. Runs mandb/makewhatis if available.
+#   3. Installs the agoo Python wheel via pip.
+#   4. Installs the man pages to PREFIX/share/man/.
+#   5. Runs mandb/makewhatis if available.
 #
 # Output: dist/install-agOO-client-TUI.sh
 set -euo pipefail
@@ -26,11 +28,21 @@ MISSING=()
 [ -f dist/agOO-client-TUI.amd64   ] || MISSING+=("dist/agOO-client-TUI.amd64")
 [ -f dist/man/man1/agOO-client-TUI.1.gz ] || MISSING+=("dist/man/man1/agOO-client-TUI.1.gz")
 [ -f dist/man/man3/agoo.3.gz            ] || MISSING+=("dist/man/man3/agoo.3.gz")
+mapfile -t _WHLS < <(ls dist/agoo-*.whl 2>/dev/null)
+if [ ${#_WHLS[@]} -eq 0 ]; then
+    MISSING+=("dist/agoo-*.whl")
+elif [ ${#_WHLS[@]} -gt 1 ]; then
+    echo "[installer] ERROR: multiple whl files found in dist/ — remove stale builds first:" >&2
+    printf '[installer]   %s\n' "${_WHLS[@]}" >&2
+    exit 1
+else
+    WHL="${_WHLS[0]}"
+fi
 
 if [ ${#MISSING[@]} -ne 0 ]; then
     echo "[installer] ERROR: missing required files:" >&2
     printf '[installer]   %s\n' "${MISSING[@]}" >&2
-    echo "[installer] Run steps 02, 03, and 04 first." >&2
+    echo "[installer] Run steps 01, 02, 03, and 04 first." >&2
     exit 1
 fi
 
@@ -62,11 +74,12 @@ usage() {
     cat <<EOF
 agOO-client-TUI installer
 
-  Installs the agOO-client-TUI static binary and man pages for the
-  current architecture.
+  Installs the agOO-client-TUI static binary, the agoo Python package,
+  and man pages for the current architecture.
 
   Install locations (override with PREFIX=/some/where):
     Binary  : $BINDIR/agOO-client-TUI
+    Python  : installed via pip (agoo)
     Man page: $MANDIR/man1/agOO-client-TUI.1.gz
               $MANDIR/man3/agoo.3.gz
 
@@ -97,6 +110,15 @@ do_uninstall() {
         $elev mandb --quiet 2>/dev/null || true
     elif command -v makewhatis >/dev/null 2>&1; then
         $elev makewhatis "$MANDIR" 2>/dev/null || true
+    fi
+    pip_cmd=""
+    if command -v pip3 >/dev/null 2>&1; then pip_cmd="pip3"
+    elif command -v pip >/dev/null 2>&1; then pip_cmd="pip"
+    fi
+    if [ -n "$pip_cmd" ]; then
+        if $elev $pip_cmd uninstall -y agoo 2>/dev/null; then
+            echo "  uninstalled agoo (Python package)"
+        fi
     fi
     echo "Done."
     exit 0
@@ -182,6 +204,29 @@ elif command -v makewhatis >/dev/null 2>&1; then
     $elev makewhatis "$MANDIR" 2>/dev/null && echo "  makewhatis updated" || true
 fi
 
+# Install Python wheel.
+whl=$(ls "$TMPDIR_INST"/agoo-*.whl 2>/dev/null | head -1)
+if [ -n "$whl" ]; then
+    pip_cmd=""
+    if command -v pip3 >/dev/null 2>&1; then pip_cmd="pip3"
+    elif command -v pip >/dev/null 2>&1; then pip_cmd="pip"
+    fi
+    if [ -n "$pip_cmd" ]; then
+        # Use --break-system-packages (pip >= 22.1) when available so that the
+        # install works on PEP 668 systems (Debian bookworm, Raspberry Pi OS
+        # bookworm, Ubuntu 22.10+) without requiring a virtual environment.
+        pip_flags="--quiet"
+        if $pip_cmd install --help 2>&1 | grep -q -- '--break-system-packages'; then
+            pip_flags="--quiet --break-system-packages"
+        fi
+        $elev $pip_cmd install $pip_flags "$whl"
+        echo "  installed $(basename "$whl") (Python package)"
+    else
+        echo "Warning: pip not found; skipping Python package installation." >&2
+        echo "  Install manually: pip install $(basename "$whl")" >&2
+    fi
+fi
+
 echo ""
 echo "agOO-client-TUI installed successfully."
 echo "  Run:  agOO-client-TUI"
@@ -199,6 +244,7 @@ trap 'rm -rf "$STAGING"' EXIT
 echo "[installer] Staging payload"
 cp dist/agOO-client-TUI.aarch64          "$STAGING/"
 cp dist/agOO-client-TUI.amd64            "$STAGING/"
+cp "$WHL"                                "$STAGING/"
 mkdir -p "$STAGING/man/man1" "$STAGING/man/man3"
 cp dist/man/man1/agOO-client-TUI.1.gz   "$STAGING/man/man1/"
 cp dist/man/man3/agoo.3.gz              "$STAGING/man/man3/"
