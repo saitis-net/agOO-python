@@ -996,10 +996,11 @@ class Agoo:
              batch as long as the running total of that batch would not exceed
              the usable space.  Files that would overflow are deferred.
           3. Every file in the batch is uploaded with temp_put().
-          4. async_synchronize() is always called after every batch — even the
-             last one — so files are migrated from cache to archive and the
-             cache is emptied.  async_completed() is polled every poll_interval
-             seconds until the job finishes before proceeding.
+          4. async_synchronize() is called only if files remain pending after
+             this batch, to reclaim cache space for the next one.
+             async_completed() is polled every poll_interval seconds until
+             the job finishes before proceeding.  The final batch's files are
+             left in temp/cache — no sync is triggered once nothing remains.
           5. Steps 1-4 repeat until all files have been uploaded.
 
         A file whose size alone exceeds the total cache capacity can never be
@@ -1222,61 +1223,56 @@ class Agoo:
             )
 
             # ---------------------------------------------------------------
-            # Sync after every batch — not just when files remain.
+            # Sync only when files are still pending.
             #
-            # Triggering async_synchronize() unconditionally ensures that
-            # every batch is migrated from temp (cache) to archive storage
-            # before we return, keeping the cache consistently empty.
-            # On the last batch this archives the final files; on earlier
-            # batches it reclaims space so the next batch can proceed.
-            #
-            # We block on async_completed() so the caller knows the data is
-            # safely in archive, not just sitting in temp, when we return.
+            # async_synchronize() exists to reclaim cache space for the next
+            # batch; if next_pending is empty there is no next batch, so
+            # triggering (and blocking on) a sync here would just be an
+            # unnecessary wait before returning. The final batch's files are
+            # left sitting in temp/cache — the caller can sync separately if
+            # archiving them immediately matters.
             # ---------------------------------------------------------------
             if next_pending:
-                sync_reason = (
-                    f"{len(next_pending)} file(s) still pending — "
-                    f"reclaiming cache space"
+                self._debug(
+                    f"batch_put: triggering archive sync "
+                    f"({len(next_pending)} file(s) still pending — "
+                    f"reclaiming cache space)…"
                 )
-            else:
-                sync_reason = "final batch — archiving uploaded files"
 
-            self._debug(f"batch_put: triggering archive sync ({sync_reason})…")
-
-            job_id = self.async_synchronize()
-            if job_id is None:
-                self._error = (
-                    "batch_put: failed to trigger archive sync: "
-                    + (self._error or "async_synchronize() returned no job ID")
-                )
-                return None
-
-            self._debug(f"batch_put: sync job queued — ID={job_id}")
-
-            # Poll until the server reports the job is done.
-            while True:
-                status = self.async_completed(job_id)
-
-                if status is None:
-                    # None means the "finished.<id>" file does not exist
-                    # yet — the job is still running.
-                    self._debug(
-                        f"batch_put: sync {job_id} still running — "
-                        f"waiting {poll_interval}s…"
-                    )
-                    time.sleep(poll_interval)
-                    continue
-
-                # Any integer means the job completed.
-                if status != 0:
+                job_id = self.async_synchronize()
+                if job_id is None:
                     self._error = (
-                        f"batch_put: sync job {job_id} finished with "
-                        f"non-zero status {status}"
+                        "batch_put: failed to trigger archive sync: "
+                        + (self._error or "async_synchronize() returned no job ID")
                     )
                     return None
 
-                self._debug(f"batch_put: sync {job_id} completed (status 0)")
-                break  # cache space reclaimed; proceed to next batch or finish
+                self._debug(f"batch_put: sync job queued — ID={job_id}")
+
+                # Poll until the server reports the job is done.
+                while True:
+                    status = self.async_completed(job_id)
+
+                    if status is None:
+                        # None means the "finished.<id>" file does not exist
+                        # yet — the job is still running.
+                        self._debug(
+                            f"batch_put: sync {job_id} still running — "
+                            f"waiting {poll_interval}s…"
+                        )
+                        time.sleep(poll_interval)
+                        continue
+
+                    # Any integer means the job completed.
+                    if status != 0:
+                        self._error = (
+                            f"batch_put: sync job {job_id} finished with "
+                            f"non-zero status {status}"
+                        )
+                        return None
+
+                    self._debug(f"batch_put: sync {job_id} completed (status 0)")
+                    break  # cache space reclaimed; proceed to next batch
 
             # Advance to the deferred files (empty on the last batch).
             pending = next_pending
